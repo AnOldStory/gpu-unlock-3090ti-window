@@ -1,0 +1,1067 @@
+RTX 3090 Ti / Windows-UEFI port - diff against upstream rough2515-hub/rtx3080-unlock-public
+(upstream files: an untouched clone of rough2515-hub/rtx3080-unlock-public)
+
+Changed upstream files (unified diff below):
+  unlock/port.h                      +7    -3
+  unlock/port.c                      +2    -1
+  unlock/checks.c                    +17   -2
+  unlock/app.c                       +156  -29
+  unlock/app_io.c                    +63   -8
+  unlock/compat.c                    +5    -0
+  unlock/ownership.c                 +26   -5
+  unlock/vendor/unlock_610.c         +8    -3
+  probe_app.c                        +134  -24
+  probe_core.c                       +31   -2
+  probe_core.h                       +18   -0
+
+New files added by this port (not present upstream):
+  unlock/board_profile.h          all card/machine expectations, one file
+  unlock/test-replay-wsl.sh       offline replay of a profiler report
+  unlock/tests/replay_report.c    host harness: runs a report through checks.c
+  tools/package_usb_3090ti.py     USB tree builder
+  tools/install_esp_entry.ps1     internal-ESP / BCD one-shot installer
+  tools/make_payload_volume.ps1   carve a FAT32 (EF00) payload partition
+  tools/install_and_check.ps1     one-UAC install + verify wrapper
+  tools/check_status.ps1          read-only status + probe export
+  docs/RTX3090TI-WINDOWS.md       build, deploy, diagnostics, risk notes
+  docs/3090ti-changes.diff        this file
+  evidence/RUN00-REPORT.TXT       measured profile from this machine
+  evidence/RUN00-PROM.BIN         live VBIOS image (1 MiB) from RUN00
+  evidence/RUN01-REPORT.TXT       RUN01: transaction success, handoff failed
+  evidence/RUN02-REPORT.TXT       RUN02: transaction + handoff + display restore
+  assets/*.bin                    five 610.43.03 assets (not redistributed upstream)
+
+Moved: build-wsl.sh -> unlock/build-wsl.sh (builds both EFI artifacts).
+Upstream files removed: none.
+
+================================================================================
+
+diff --git a/unlock/port.h b/unlock/port.h
+--- a/unlock/port.h
++++ b/unlock/port.h
+@@ -4,9 +4,10 @@
+ #include <Protocol/DevicePath.h>
+ #include <stddef.h>
+ 
+-#define GU_BOARD_ID 0x220610deU
+-#define GU_BOARD_SUBSYSTEM 0x38901462U
+-#define GU_BOARD_CHIP 0xb72000a1U
++/* Card, location, BAR, cold-state, ROM and display expectations live in
++   board_profile.h so that retargeting is a one-file change. */
++#include "board_profile.h"
++#define GU_TARGET_PCI_ID GU_BOARD_ID
+ typedef struct GU_DMA GU_DMA;
+ struct GU_DMA {
+   GU_DMA *next;
+@@ -25,6 +26,9 @@
+   UINT16 saved_devctl, saved_devctl2;
+   UINT8 pcie_version;
+   BOOLEAN fault, retained, started, quiesced, armed, owned, display_ok, saved;
++  /* Set once the firmware display driver has been released because it was the
++     console on the target card: the conflicting display is already gone. */
++  BOOLEAN console_released;
+   BOOLEAN master_attributes_pending;
+   UINT64 master_original_attributes;
+   UINT16 master_original_command;
+
+diff --git a/unlock/port.c b/unlock/port.c
+--- a/unlock/port.c
++++ b/unlock/port.c
+@@ -6,7 +6,8 @@
+   memset(&Gu,0,sizeof(Gu)); Gu.bs=Bs; Gu.pci=Pci;
+ }
+ BOOLEAN GuTargetConfig(const UINT32 *C, UINTN S, UINTN B, UINTN D, UINTN F) {
+-  return C && !S && B==1 && !D && !F && C[0]==GU_BOARD_ID &&
++  return C && !S && B==GU_BOARD_BUS && D==GU_BOARD_DEVICE && F==GU_BOARD_FUNCTION &&
++    C[0]==GU_BOARD_ID &&
+     C[11]==GU_BOARD_SUBSYSTEM && (C[2]>>24)==3 && !((C[3]>>16)&0x7f);
+ }
+ BOOLEAN GuSafeToReturn(VOID) {
+
+diff --git a/unlock/checks.c b/unlock/checks.c
+--- a/unlock/checks.c
++++ b/unlock/checks.c
+@@ -26,7 +26,8 @@
+ 
+   if (Out == NULL) return FALSE;
+   *Out = Caps;
+-  if (Config == NULL || Segment != 0 || Bus != 1 || Device != 0 || Function != 0)
++  if (Config == NULL || Segment != 0 || Bus != GU_BOARD_BUS ||
++      Device != GU_BOARD_DEVICE || Function != GU_BOARD_FUNCTION)
+     return FALSE;
+   if (Config[0] != GU_BOARD_ID || Config[0x2c / 4] != GU_BOARD_SUBSYSTEM ||
+       ConfigByte(Config, 0x0b) != PCI_CLASS_DISPLAY ||
+@@ -150,6 +151,20 @@
+   return TRUE;
+ }
+ 
++/* A PCIe root port node. Unlike the endpoint node, an AMD root port can live on
++   function 1 (this machine: 00:03.1), so only the device number is matched. The
++   endpoint node below still has to be a function-0 device. */
++static BOOLEAN TakePciPort(const UINT8 **Bytes, UINTN *Remaining, UINT8 Device) {
++  const UINT8 *Node = *Bytes;
++  if (NodeLength(Node, *Remaining) != sizeof(PCI_DEVICE_PATH) ||
++      Node[0] != HARDWARE_DEVICE_PATH || Node[1] != HW_PCI_DP ||
++      Node[5] != Device)
++    return FALSE;
++  *Bytes += sizeof(PCI_DEVICE_PATH);
++  *Remaining -= sizeof(PCI_DEVICE_PATH);
++  return TRUE;
++}
++
+ int GuDisplayPath(const EFI_DEVICE_PATH_PROTOCOL *Path, UINTN MaxBytes) {
+   const UINT8 *Bytes = (const UINT8 *)Path;
+   UINT32 Hid;
+@@ -166,7 +181,8 @@
+ 
+   if (TakePci(&Bytes, &MaxBytes, 2)) {
+     Route = 1;
+-  } else if (TakePci(&Bytes, &MaxBytes, 1) && TakePci(&Bytes, &MaxBytes, 0)) {
++  } else if (TakePciPort(&Bytes, &MaxBytes, GU_BOARD_PATH_PORT_DEVICE) &&
++             TakePci(&Bytes, &MaxBytes, GU_BOARD_DEVICE)) {
+     Route = 2;
+   } else {
+     return 0;
+
+diff --git a/unlock/app.c b/unlock/app.c
+--- a/unlock/app.c
++++ b/unlock/app.c
+@@ -55,7 +55,7 @@
+   return valid;
+ }
+ static BOOLEAN DisplayCheck(VOID) {
+-  EFI_HANDLE *handles=NULL;UINTN count=0,intel=0;BOOLEAN valid=TRUE;
++  EFI_HANDLE *handles=NULL;UINTN count=0,intel=0,screens=0;BOOLEAN valid=TRUE,target_screen=FALSE,target_route=FALSE;
+   EFI_GRAPHICS_OUTPUT_MODE_INFORMATION physical={0},forwarded={0};BOOLEAN forwarding=FALSE;
+   EFI_STATUS status=Gu.bs->LocateHandleBuffer(ByProtocol,&GopGuid,NULL,&count,&handles);
+   GuLog("GOP enumeration: status=%#llx handles=%zu\n",(unsigned long long)status,(size_t)count);
+@@ -80,7 +80,7 @@
+         if(info.PixelFormat==PixelBltOnly)continue;
+         /* EDK2 ConSplitter forwards QueryMode to its sole physical GOP. Accept
+            that RGB/BGR result only on the system console, then match it against
+-           the one validated Intel GOP after enumeration (handle order varies). */
++           the one validated physical GOP after enumeration (handle order varies). */
+         if(handles[i]==Table->ConsoleOutHandle && !forwarding) {
+           forwarded=info;forwarding=TRUE;continue;
+         }
+@@ -89,22 +89,38 @@
+     }
+     if(!mode->Info || mode->SizeOfInfo<sizeof(*mode->Info)){valid=FALSE;break;}
+     GopInfoLog(i,mode->Info);
+-    if(EFI_ERROR(status) || !path || route!=1 || !mode->FrameBufferBase ||
++    /* The authored configuration required the console on another adapter
++       (route 1). The single-GPU profile accepts the target card as the console
++       (route 2) and only requires the framebuffer to be sane. */
++    if(EFI_ERROR(status) || !path || (!GU_PROFILE_ALLOW_TARGET_DISPLAY && route!=1) ||
++       (GU_PROFILE_ALLOW_TARGET_DISPLAY && route==0) || !mode->FrameBufferBase ||
+        !mode->FrameBufferSize || mode->Info->PixelFormat>PixelBlueGreenRedReserved8BitPerColor ||
+        !mode->Info->HorizontalResolution || !mode->Info->VerticalResolution ||
+        mode->Info->PixelsPerScanLine<mode->Info->HorizontalResolution ||
+        (UINT64)mode->Info->PixelsPerScanLine*mode->Info->VerticalResolution>mode->FrameBufferSize/4) {
+       valid=FALSE;break;
+     }
+-    physical=*mode->Info;intel++;
++    physical=*mode->Info;screens++;
++    if(route==1)intel++;
++    if(route==2)target_route=TRUE;
++    if(route==2 && handles[i]==Table->ConsoleOutHandle)target_screen=TRUE;
+   }
+   if(forwarding) {
+-    BOOLEAN match=intel==1 && forwarded.Version==physical.Version && forwarded.PixelFormat==physical.PixelFormat &&
++    BOOLEAN match=(GU_PROFILE_ALLOW_TARGET_DISPLAY?screens==1:intel==1) &&
++      forwarded.Version==physical.Version && forwarded.PixelFormat==physical.PixelFormat &&
+       forwarded.HorizontalResolution==physical.HorizontalResolution && forwarded.VerticalResolution==physical.VerticalResolution &&
+       forwarded.PixelsPerScanLine==physical.PixelsPerScanLine;
+-    GuLog("GOP console forwarded Intel match=%u\n",match);valid=valid && match;
++    GuLog("GOP console forwarded physical match=%u\n",match);valid=valid && match;
+   }
+-  GuFree(handles);GuLog("GOP result: valid=%u intel_physical=%zu\n",valid,(size_t)intel);
++  GuFree(handles);
++  GuLog("GOP result: valid=%u intel_physical=%zu screens=%zu console_on_target=%u target_route=%u allow_target_display=%u\n",
++    valid,(size_t)intel,(size_t)screens,(unsigned)target_screen,(unsigned)target_route,(unsigned)GU_PROFILE_ALLOW_TARGET_DISPLAY);
++  /* On a single-GPU machine the firmware exposes the GPU's own GOP without
++     forwarding it through the console handle, so target_screen stays clear even
++     though the console really is on the target card. Warn on either signal. */
++  if(target_screen || (GU_PROFILE_ALLOW_TARGET_DISPLAY && screens==1 && target_route))
++    GuLogText("WARNING: the console display is the target card. The screen will blank between FLR and Windows taking over.\n");
++  if(GU_PROFILE_ALLOW_TARGET_DISPLAY)return valid && screens==1 && GuLogReady();
+   return valid && intel==1 && GuLogReady();
+ }
+ static EFI_STATUS ReadConfig(UINT32 *Config) {
+@@ -121,12 +137,16 @@
+   if(EFI_ERROR(status))return status;
+   status=ReadConfig(config);if(EFI_ERROR(status))return status;
+   BOOLEAN checked=GuCheckConfig(config,segment,bus,device,function,&caps);
+-  BOOLEAN valid=checked && config[2]==0x030000a1 && config[0xc8/4]==0x00050011 &&
+-    config[0x10/4]==0x84000000 && !(config[(caps.pcie+8)/4]&0x00200000U);
++  BOOLEAN classrev=(config[2]&0xffffff00U)==0x03000000U && (config[2]&0xffU)==GU_BOARD_REVISION;
++  BOOLEAN c8ok=(GU_BOARD_CFG_C8==GU_BOARD_CFG_C8_ANY)?TRUE:(config[0xc8/4]==GU_BOARD_CFG_C8);
++  BOOLEAN barok=(GU_BOARD_BAR0_BASE==GU_BOARD_BAR0_ANY)?TRUE:(config[0x10/4]==GU_BOARD_BAR0_BASE);
++  BOOLEAN valid=checked && classrev && c8ok && barok &&
++    !(config[(caps.pcie+8)/4]&0x00200000U);
+   BOOLEAN same=Save || !memcmp(config,InitialConfig,sizeof(config));
+   if(Save || !valid || !same)ConfigLog(config);
+-  GuLog("target BDF=%zu:%zu:%zu.%zu checks=%u pm=%#x pcie=%#x msi=%#x msix=%#x\n",
++  GuLog("target BDF=%zu:%zu:%zu.%zu checks=%u classrev=%u c8=%u bar=%u pm=%#x pcie=%#x msi=%#x msix=%#x\n",
+     (size_t)segment,(size_t)bus,(size_t)device,(size_t)function,checked,
++    classrev,c8ok,barok,
+     (unsigned)caps.pm,(unsigned)caps.pcie,(unsigned)caps.msi,(unsigned)caps.msix);
+   if(!valid)return EFI_UNSUPPORTED;
+   if(!same)return EFI_NOT_READY;
+@@ -208,10 +228,13 @@
+         (unsigned)r->ResType,(unsigned long long)r->AddrSpaceGranularity,(unsigned long long)r->AddrRangeMin,
+         (unsigned long long)r->AddrRangeMax,(unsigned long long)r->AddrLen,(unsigned long long)r->AddrTranslationOffset);
+     if(!r || r->Desc!=ACPI_ADDRESS_SPACE_DESCRIPTOR || r->Len!=sizeof(*r)-3 || r->ResType!=0 ||
+-      r->AddrRangeMin!=0x84000000 || r->AddrLen!=0x1000000 || r->AddrTranslationOffset ||
++      /* A pinned board address is optional; the descriptor shape is not. */
++      (GU_BOARD_BAR0_BASE!=GU_BOARD_BAR0_ANY && r->AddrRangeMin!=GU_BOARD_BAR0_BASE) ||
++      r->AddrLen!=GU_BOARD_BAR0_SIZE || r->AddrTranslationOffset ||
+       /* UEFI describes an inclusive end; pinned EDK2 PciBusDxe instead returns
+-         PciBar.Alignment. Both representations describe this exact 16 MiB BAR. */
+-      (r->AddrRangeMax!=0x84ffffff && r->AddrRangeMax!=0x00ffffff) ||
++         PciBar.Alignment. Both representations describe this exact BAR. */
++      !((r->AddrRangeMax==r->AddrRangeMin+r->AddrLen-1) ||
++        (r->AddrRangeMax==r->AddrLen-1)) ||
+       r->AddrSpaceGranularity!=32 || ((UINT8 *)(r+1))[0]!=ACPI_END_TAG_DESCRIPTOR)status=EFI_UNSUPPORTED;
+     else {
+       UINT8 *raw=(UINT8 *)r,sum=0;
+@@ -222,36 +245,89 @@
+   }
+   if(r)GuFree(r);return status;
+ }
++static BOOLEAN WarmBoot;
+ static EFI_STATUS ColdCheck(VOID) {
+-  UINT32 chip=GuRead32(0);GuLog("chip: actual=%#x expected=%#x\n",chip,GU_BOARD_CHIP);
++  UINT32 chip=GuRead32(0),plm=GuRead32(GU_FEAT_PLM_OFFSET),ss0=GuRead32(GU_FEAT_SS0_OFFSET),
++    ss1=GuRead32(GU_FEAT_SS1_OFFSET),cold_1183a4=GuRead32(0x1183a4),hi=GuRead32(0x1fa828);
++  BOOLEAN accessible=(ss0!=0xffffffffU && ss1!=0xffffffffU);
++  BOOLEAN observed=(ss0==GU_BOARD_COLD_SS0 && ss1==GU_BOARD_COLD_SS1 && cold_1183a4==GU_BOARD_COLD_1183A4);
++  GuLog("cold state: chip=%#x plm=%#x SS0=%#x SS1=%#x 1183a4=%#x wpr2_hi=%#x\n",
++    chip,plm,ss0,ss1,cold_1183a4,hi);
++  GuLog("chip: actual=%#x expected=%#x\n",chip,GU_BOARD_CHIP);
+   if(chip!=GU_BOARD_CHIP)return EFI_UNSUPPORTED;
+   struct gpu_unlock_gfw_sample s={.config_ok=true,.plm=GuRead32(GU_GFW_PLM_OFFSET),
+     .boot=GuRead32(GU_GFW_BOOT_OFFSET),.cpuctl=GuRead32(GU_GFW_CPUCTL_OFFSET)};
+-  UINT32 hi=GuRead32(0x1fa828),plm=GuRead32(GU_FEAT_PLM_OFFSET),ss0=GuRead32(GU_FEAT_SS0_OFFSET),ss1=GuRead32(GU_FEAT_SS1_OFFSET);
+-  GuLog("cold state: chip=%#x plm=%#x gfw=%#x/%#x/%#x WPR2_HI=%#x SS0=%#x SS1=%#x\n",
+-    GU_BOARD_CHIP,plm,s.plm,s.boot,s.cpuctl,hi,ss0,ss1);
+-  if(Gu.fault || gpu_unlock_gfw_assess(&s) || hi>>4 || plm!=0xffffff8f ||
+-    ss0!=0x46254040 || (ss1!=2 && ss1!=3) || GuRead32(0x1183a4)!=0x2800)return EFI_NOT_READY;
++  GuLog("cold expected: plm=%#x SS0=%#x SS1=%#x 1183a4=%#x wpr2_hi<=%#x strict=%u observed=%u accessible=%u\n",
++    GU_BOARD_COLD_PLM,GU_BOARD_COLD_SS0,GU_BOARD_COLD_SS1,GU_BOARD_COLD_1183A4,GU_BOARD_COLD_WPR2_MAX,
++    (unsigned)GU_BOARD_COLD_STRICT,(unsigned)observed,(unsigned)accessible);
++  /* SS0/SS1 are gated on readability, exactly as the validated 3090 Ti Linux
++     module does (this card's SS1 reads 6, the authored 3080 saw 2 or 3), and the
++     written values are verified again after the selector writes. Set
++     GU_BOARD_COLD_STRICT to demand the measured values instead. */
++  if(Gu.fault || gpu_unlock_gfw_assess(&s) || hi>GU_BOARD_COLD_WPR2_MAX || plm!=GU_BOARD_COLD_PLM ||
++    !accessible || (GU_BOARD_COLD_STRICT && !observed)) {
++    /* WPR2 already programmed means the card was initialised in this power cycle:
++       a warm reboot, not a cold boot. Nothing has been touched at this point. */
++    if(hi>GU_BOARD_COLD_WPR2_MAX) {
++      WarmBoot=TRUE;
++      GuLogText("cold state: WPR2 is already set, so this is a warm boot; the unlock needs a full power-off.\n");
++    }
++    return EFI_NOT_READY;
++  }
+   return Gu.fault?EFI_DEVICE_ERROR:EFI_SUCCESS;
+ }
++static VOID DigestLog(const UINT8 Digest[32]) {
++  static const char Digits[]="0123456789abcdef";char Hex[65];
++  for(UINTN i=0;i<32;i++){Hex[i*2]=Digits[Digest[i]>>4];Hex[i*2+1]=Digits[Digest[i]&15];}
++  Hex[64]=0;GuLog("live PROM sha256=%s\n",Hex);
++}
+ static EFI_STATUS PromCheck(VOID) {
+   VOID *prom=GuAlloc(1048576);if(!prom)return EFI_OUT_OF_RESOURCES;
+   GuCopyFromIo(prom,(VOID *)(UINTN)(Gu.bar_base+0x300000),1048576);
+-  BOOLEAN good=!Gu.fault && GuHashMatches(prom,1048576,"f3dc8f07b0b8c9856d192df172dfa7f7f84ac17ef6edfdb448ad7fa94efd2789");
+-  GuFree(prom);GuLog("live PROM hash matched=%u\n",(unsigned)good);return good?EFI_SUCCESS:EFI_CRC_ERROR;
++  UINT8 digest[32];GuSha256(prom,1048576,digest);DigestLog(digest);
++  if(GU_BOARD_PROM_SHA256[0]==0) {
++    GuLogText("board ROM profile is unset: paste the sha256 above into GU_BOARD_PROM_SHA256 and rebuild.\n");
++    GuFree(prom);return Gu.fault?EFI_DEVICE_ERROR:EFI_CRC_ERROR;
++  }
++  BOOLEAN good=!Gu.fault && GuHashMatches(prom,1048576,GU_BOARD_PROM_SHA256);
++  GuFree(prom);GuLog("live PROM hash matched=%u expected=%s\n",(unsigned)good,GU_BOARD_PROM_SHA256);
++  return good?EFI_SUCCESS:EFI_CRC_ERROR;
+ }
++static BOOLEAN ArmedManually;
+ static EFI_STATUS Arm(VOID) {
+   if(!Table->ConIn || !Table->ConIn->Reset || !Table->ConIn->ReadKeyStroke)return EFI_UNSUPPORTED;
+   EFI_STATUS status=Table->ConIn->Reset(Table->ConIn,FALSE);if(EFI_ERROR(status))return status;
+-  GuLogText("READY: MSI RTX 3080 10GB / Intel display / verified USB log and firmware.\n");
+-  if(PendingOwner.agent)GuLogText("U will release the RTX firmware driver, restore verified access settings if needed, then recheck and attempt once.\n");
++  GuLogText("READY: " GU_PROFILE_NAME " / single-GPU profile / verified boot-volume log and firmware.\n");
++  GuLogText("Console is the target card: expect a blank screen between FLR and Windows taking over.\n");
++  if(PendingOwner.agent)GuLogText("The start releases the RTX firmware driver, restores verified access settings if needed, then rechecks and attempts once.\n");
++  if(PendingOwner.agent && GU_PROFILE_RELEASE_CONSOLE_DRIVER)
++    GuLogText("That release removes the console display driver, so this screen stops updating: the report continues on the boot volume.\n");
++  if(!GuLogReady())return EFI_DEVICE_ERROR;
++  /* Automatic mode: the entry runs on every boot, so the cold boot is the
++     confirmation and any key during the countdown is the way out. A marker left by
++     an attempt that did not finish keeps automatic start off for this boot. */
++  BOOLEAN manual=GU_PROFILE_AUTO_ARM && GuMarkFailedRead();
++  if(manual)GuLogText("A previous attempt did not finish: automatic start is off for this boot.\n");
++  if(GU_PROFILE_AUTO_ARM && !manual) {
++    for(UINTN left=GU_PROFILE_AUTO_ARM_SECONDS;left>0;left--) {
++      GuLog("AUTO: starting in %u s; press any key to boot Windows without unlocking.\n",(unsigned)left);
++      if(!GuLogReady())return EFI_DEVICE_ERROR;
++      for(UINTN tick=0;tick<10;tick++) {
++        EFI_INPUT_KEY key;status=Table->ConIn->ReadKeyStroke(Table->ConIn,&key);
++        if(!EFI_ERROR(status)) {GuLogText("AUTO: skipped by key press; nothing was changed.\n");return EFI_ABORTED;}
++        if(status!=EFI_NOT_READY)return status;
++        GuStall(100000);
++      }
++    }
++    return EFI_SUCCESS;
++  }
+   GuLogText("Press U to attempt once; Esc or 30-second timeout cancels.\n");
+   if(!GuLogReady())return EFI_DEVICE_ERROR;
+   for(UINTN i=0;i<300;i++) {
+     EFI_INPUT_KEY key;status=Table->ConIn->ReadKeyStroke(Table->ConIn,&key);
+     if(!EFI_ERROR(status)) {
+       if(key.ScanCode==0x17 || key.UnicodeChar==27)return EFI_ABORTED;
+-      if(key.UnicodeChar=='u' || key.UnicodeChar=='U')return EFI_SUCCESS;
++      if(key.UnicodeChar=='u' || key.UnicodeChar=='U'){ArmedManually=TRUE;return EFI_SUCCESS;}
+     } else if(status!=EFI_NOT_READY)return status;
+     GuStall(100000);
+   }
+@@ -285,7 +361,7 @@
+   if(!St || !St->BootServices || !St->RuntimeServices)return EFI_INVALID_PARAMETER;
+   Table=St;GuInit(St->BootServices,NULL);Gu.image=Image;Gu.display_check=DisplayCheck;
+   memset(&PendingOwner,0,sizeof(PendingOwner));
+-  Stage="usb-log";EFI_STATUS status=GuIoOpen(Image,St);BOOLEAN attempted=FALSE,release_attempted=FALSE;
++  Stage="boot-volume-log";EFI_STATUS status=GuIoOpen(Image,St);BOOLEAN attempted=FALSE,release_attempted=FALSE;
+   if(EFI_ERROR(status))goto finish;
+   UINT8 secure=0xff;UINTN bytes=1;
+   Stage="secure-boot";
+@@ -298,7 +374,7 @@
+   Stage="ownership";status=GuClaimController();
+   if(status==EFI_ACCESS_DENIED) {
+     status=GuFindReleaseOwner(St,&PendingOwner,TRUE);
+-    if(!EFI_ERROR(status))GuLogText("Exclusive ownership deferred until manual U and explicit driver release.\n");
++    if(!EFI_ERROR(status))GuLogText("Exclusive ownership deferred: the driver is released only after the start is confirmed.\n");
+   }
+   status=Step(status);if(EFI_ERROR(status))goto finish;
+   Stage="config-recheck";status=Step(ConfigCheck(FALSE));if(EFI_ERROR(status))goto finish;
+@@ -313,13 +389,22 @@
+   if(PendingOwner.agent) {
+     GU_RELEASE_OWNER current;
+     Stage="owner-recheck";
+-    GuLogText("Manual U confirmed: release RTX firmware driver once, then revalidate.\n");
++    GuLogText(ArmedManually?"Manual U confirmed: release RTX firmware driver once, then revalidate.\n"
++      :"Start confirmed: release RTX firmware driver once, then revalidate.\n");
+     if(!GuLogReady()){status=EFI_DEVICE_ERROR;goto finish;}
+     /* Durable intent precedes the last owner snapshot. No file IO between a
+        successful final comparison and DisconnectController. */
+     status=GuFindReleaseOwner(St,&current,FALSE);
+     if(!EFI_ERROR(status) && !GuSameReleaseOwner(&PendingOwner,&current))status=EFI_ABORTED;
+     if(EFI_ERROR(status)){status=Step(status);goto finish;}
++    if(GU_PROFILE_RELEASE_CONSOLE_DRIVER) {
++      /* The driver about to be released produces this console's output, so text
++         stops here. Mute before the call: a dead console must not be recorded as
++         a logging fault, and the report stays the authoritative record. */
++      GuLogText("Screen output ends now: releasing the console display driver.\n");
++      if(!GuLogReady()){status=EFI_DEVICE_ERROR;goto finish;}
++      GuMuteConsole();Gu.console_released=TRUE;
++    }
+     EFI_PCI_IO_PROTOCOL *prior=Gu.pci;
+     Stage="driver-release";release_attempted=TRUE;Gu.armed=TRUE;Gu.pci=NULL;
+     EFI_STATUS released=Gu.bs->DisconnectController(Gu.handle,current.agent,NULL);
+@@ -331,15 +416,28 @@
+     status=Step(EFI_ERROR(released)?released:EFI_ERROR(refreshed)?refreshed:Gu.pci!=prior?EFI_COMPROMISED_DATA:EFI_SUCCESS);
+     if(EFI_ERROR(status))goto finish;
+     Stage="ownership-after-release";status=Step(GuClaimController());if(EFI_ERROR(status))goto finish;
+-    Stage="display-after-release";Gu.display_ok=DisplayCheck();status=Step(Gu.display_ok?EFI_SUCCESS:EFI_UNSUPPORTED);if(EFI_ERROR(status))goto finish;
++    Stage="display-after-release";
++    if(GU_PROFILE_RELEASE_CONSOLE_DRIVER) {
++      /* The released owner was the console display driver, so the GOP and its
++         text output are gone by design and there is nothing left to revalidate.
++         The unlock itself only needs the card, not a display. */
++      GuLogText("display-after-release skipped: the released driver was the console\n");
++      status=Step(EFI_SUCCESS);
++    } else {
++      Gu.display_ok=DisplayCheck();status=Step(Gu.display_ok?EFI_SUCCESS:EFI_UNSUPPORTED);
++    }
++    if(EFI_ERROR(status))goto finish;
+     Stage="decode-after-release";status=Step(RestoreDecode());if(EFI_ERROR(status))goto finish;
+     Stage="config-after-release";status=Step(ConfigCheck(FALSE));if(EFI_ERROR(status))goto finish;
+     Stage="bar0-after-release";status=Step(BarCheck());if(EFI_ERROR(status))goto finish;
+     Stage="cold-after-release";status=Step(ColdCheck());if(EFI_ERROR(status))goto finish;
+     Stage="prom-after-release";status=Step(PromCheck());if(EFI_ERROR(status))goto finish;
+   }
+-  GuLogText("ARMED: one transaction is starting. Do not reset or remove the USB.\n");
++  GuLogText("ARMED: one transaction is starting. Do not reset or remove the boot volume.\n");
+   if(!GuLogReady()){status=EFI_DEVICE_ERROR;goto finish;}
++  /* Durable intent before any register access: if this attempt never reaches its
++     end, the next boot asks for an explicit U instead of retrying unattended. */
++  Stage="attempt-marker";status=Step(GuMarkFailedWrite(TRUE));if(EFI_ERROR(status))goto finish;
+   Stage="transaction";Gu.armed=TRUE;attempted=TRUE;
+   UINT64 mask=0xffffffffULL;
+   struct pci_dev device={.dev={.dma_mask=&mask,.coherent_dma_mask=0xffffffffULL},.pm_cap=Gu.pm_cap,.refs=1};
+@@ -354,6 +452,34 @@
+   if(EFI_ERROR(contained) || !GuSafeToReturn() || Gu.allocations || (Gu.started && result))Halt();
+   gpu_unlock_610_release_shared(&shared);Gu.armed=FALSE;
+   status=result?EFI_DEVICE_ERROR:EFI_SUCCESS;
++  if(!result) {
++    /* Success is the only way back to unattended start. */
++    EFI_STATUS cleared=GuMarkFailedWrite(FALSE);
++    GuLog("attempt marker cleared=%u\n",(unsigned)!EFI_ERROR(cleared));
++  }
++  if(!EFI_ERROR(status) && Gu.console_released) {
++    /* RUN01 reached the end of the transaction and then never handed off: the
++       firmware boot menu and Windows Boot Manager both need a graphics console,
++       and the display driver was released for the FLR. Reconnect it so the
++       handoff looks like a normal boot, then read the selectors back to prove
++       the unlock survived that driver's initialisation. */
++    Stage="display-restore";
++    if(Gu.owned) {
++      EFI_STATUS closed=Gu.bs->CloseProtocol(Gu.handle,&PciGuid,Image,NULL);
++      if(!EFI_ERROR(closed))Gu.owned=FALSE;
++    }
++    EFI_STATUS connected=Gu.bs->ConnectController?Gu.bs->ConnectController(Gu.handle,NULL,NULL,TRUE):EFI_UNSUPPORTED;
++    GuLog("display restore: connect=%#llx owned=%u\n",(unsigned long long)connected,(unsigned)Gu.owned);
++    if(!EFI_ERROR(connected) && !EFI_ERROR(GuRefreshTargetPci())) {
++      GuLog("post-restore selectors: SS0=%#x SS1=%#x (unlock wrote 0x88888888/0x8)\n",
++        GuRead32(GU_FEAT_SS0_OFFSET),GuRead32(GU_FEAT_SS1_OFFSET));
++      GuUnmuteConsole();Gu.display_ok=DisplayCheck();
++      if(Gu.display_ok)GuLogText("Display restored: the released driver reconnected, screen output resumes.\n");
++      else GuLog("display restore incomplete: console unusable, handoff continues without it\n");
++    } else {
++      GuLog("display restore failed: handoff continues without a console\n");
++    }
++  }
+ finish:
+   if(release_attempted && (EFI_ERROR(status) || Gu.fault))ReleaseHalt(status,attempted);
+   if(attempted && !GuSafeToReturn())Halt();
+@@ -369,6 +495,7 @@
+   }
+   GuReleaseAssets();
+   if(!EFI_ERROR(status))GuConsole("UEFI transaction completed and cleaned up. Returning to firmware; Windows validation is pending.\n");
++  else if(WarmBoot)GuConsole("Not a cold boot; nothing was changed. Continuing to Windows.\n");
+   else GuConsole("Attempt cancelled or rejected. Returning without another attempt.\n");
+   return status;
+ }
+
+diff --git a/unlock/app_io.c b/unlock/app_io.c
+--- a/unlock/app_io.c
++++ b/unlock/app_io.c
+@@ -10,6 +10,10 @@
+ static EFI_SYSTEM_TABLE *Table;
+ static EFI_FILE_PROTOCOL *Root,*Parent,*Run,*Report;
+ static BOOLEAN LogFault;
++/* Single-GPU profile: the driver released before the FLR is the console, so
++   text output is gone from that point on. Muting keeps the report authoritative
++   instead of turning a dead console into a logging fault. */
++static BOOLEAN ConsoleMuted;
+ typedef struct {const char *name;CHAR16 *file;UINTN size;const char *hash;} ASSET_SPEC;
+ static const ASSET_SPEC Specs[]={
+  {"gpu-unlock/610.43.03/booter_load_ga102.bin",L"ASSETS\\booter_load_ga102.bin",61256,"056cbc064a888f80717726c54d7f64fcd68044d123870c95a74f37f4975dcaa4"},
+@@ -19,7 +23,16 @@
+  {"gpu-unlock/610.43.03/gsp_boot_desc_ga102.bin",L"ASSETS\\gsp_boot_desc_ga102.bin",84,"cc5a3fc1f4c47f2fe107b1b68f0176d8a448e6dec84b575e5560ccef5262bf15"}
+ };
+ static VOID LogError(VOID){LogFault=TRUE;if(Gu.armed)Gu.fault=TRUE;}
++VOID GuMuteConsole(VOID){ConsoleMuted=TRUE;}
++static BOOLEAN ConsoleWritable(VOID) {
++  return Table && Table->ConOut && Table->ConOut->OutputString &&
++    !EFI_ERROR(Table->ConOut->OutputString(Table->ConOut,L"\r\n"));
++}
++/* Unmute only once the console demonstrably accepts output again, so that a
++   failed display restore cannot turn into a logging fault. */
++VOID GuUnmuteConsole(VOID){if(ConsoleMuted && ConsoleWritable())ConsoleMuted=FALSE;}
+ VOID GuConsole(const char *Text) {
++  if(ConsoleMuted)return;
+   if(!Table || !Table->ConOut || !Table->ConOut->OutputString){LogError();return;}
+   while(*Text) {
+     CHAR16 line[128];UINTN n=0;
+@@ -41,18 +54,58 @@
+   GuLogText(text);
+ }
+ BOOLEAN GuLogReady(VOID){return Report && !LogFault;}
+-static BOOLEAN UsbPath(EFI_HANDLE Handle) {
++/* Automatic mode runs on every boot, so an attempt that did not reach its end must
++   not be retried unattended: UNFINISHED.TXT records that intent before the
++   transaction and is deleted only after a successful one. */
++#define GU_MARKER L"UNFINISHED.TXT"
++static EFI_STATUS MarkerOpen(EFI_FILE_PROTOCOL **File,UINT64 Mode) {
++  if(!Parent)return EFI_NOT_READY;
++  return Parent->Open(Parent,File,GU_MARKER,Mode,0);
++}
++BOOLEAN GuMarkFailedRead(VOID) {
++  EFI_FILE_PROTOCOL *file=NULL;
++  EFI_STATUS status=MarkerOpen(&file,EFI_FILE_MODE_READ);
++  if(EFI_ERROR(status) || !file)return FALSE;
++  /* Close invalidates the handle even on error. */
++  file->Close(file);
++  return TRUE;
++}
++EFI_STATUS GuMarkFailedWrite(BOOLEAN Present) {
++  EFI_FILE_PROTOCOL *file=NULL;
++  EFI_STATUS status=MarkerOpen(&file,Present?EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE|EFI_FILE_MODE_CREATE
++    :EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE);
++  if(EFI_ERROR(status) || !file)return EFI_ERROR(status)?status:EFI_DEVICE_ERROR;
++  if(!Present) {
++    /* Delete requires write access and closes the handle on success. */
++    status=file->Delete(file);
++    if(EFI_ERROR(status))file->Close(file);
++    return status;
++  }
++  UINTN size=1;
++  status=file->Write(file,&size,(VOID *)"1");
++  EFI_STATUS closed=file->Close(file);
++  return EFI_ERROR(status)?status:closed;
++}
++/* 0 = refuse, 1 = USB image, 2 = internal EFI System Partition image.
++   The path must still terminate cleanly; the marker directory is checked
++   separately before any file is created. */
++static int TrustedPath(EFI_HANDLE Handle) {
+   EFI_DEVICE_PATH_PROTOCOL *path=NULL;
+-  if(EFI_ERROR(Table->BootServices->HandleProtocol(Handle,&PathGuid,(VOID **)&path)) || !path)return FALSE;
++  if(EFI_ERROR(Table->BootServices->HandleProtocol(Handle,&PathGuid,(VOID **)&path)) || !path)return 0;
+   UINTN total=0;BOOLEAN usb=FALSE;
+   for(UINTN nodes=0;nodes<64 && total+4<=4096;nodes++) {
+     UINTN n=path->Length[0]+((UINTN)path->Length[1]<<8);
+-    if(n<4 || n>4096-total)return FALSE;
++    if(n<4 || n>4096-total)return 0;
+     if(path->Type==MESSAGING_DEVICE_PATH && path->SubType==MSG_USB_DP && n==sizeof(USB_DEVICE_PATH))usb=TRUE;
+-    if(path->Type==END_DEVICE_PATH_TYPE)return usb && n==4 && path->SubType==END_ENTIRE_DEVICE_PATH_SUBTYPE;
++    if(path->Type==END_DEVICE_PATH_TYPE) {
++      BOOLEAN ok=n==4 && path->SubType==END_ENTIRE_DEVICE_PATH_SUBTYPE;
++      if(!ok)return 0;
++      if(usb)return 1;
++      return GU_PROFILE_ALLOW_INTERNAL_ESP?2:0;
++    }
+     total+=n;path=(VOID *)((UINT8 *)path+n);
+   }
+-  return FALSE;
++  return 0;
+ }
+ static EFI_STATUS Metadata(EFI_FILE_PROTOCOL *File,BOOLEAN Directory,UINTN Expected) {
+   union {EFI_FILE_INFO info;UINT8 bytes[512];} data;UINTN n=sizeof(data);
+@@ -67,11 +120,12 @@
+   Table=St;Root=Parent=Run=Report=NULL;LogFault=FALSE;memset(GuAssets,0,sizeof(GuAssets));
+   EFI_LOADED_IMAGE_PROTOCOL *loaded=NULL;EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs=NULL;
+   EFI_STATUS status=Table->BootServices->HandleProtocol(Image,&LoadedGuid,(VOID **)&loaded);
+-  if(EFI_ERROR(status) || !loaded || !UsbPath(loaded->DeviceHandle))return EFI_UNSUPPORTED;
++  int route=loaded?TrustedPath(loaded->DeviceHandle):0;
++  if(EFI_ERROR(status) || !loaded || route==0)return EFI_UNSUPPORTED;
+   status=Table->BootServices->HandleProtocol(loaded->DeviceHandle,&FsGuid,(VOID **)&fs);
+   if(EFI_ERROR(status) || !fs)return EFI_UNSUPPORTED;
+   status=fs->OpenVolume(fs,&Root);if(EFI_ERROR(status) || !Root)return EFI_DEVICE_ERROR;
+-  status=Root->Open(Root,&Parent,L"\\RTX3080-UNLOCK",EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE,0);
++  status=Root->Open(Root,&Parent,GU_PROFILE_PAYLOAD_DIR,EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE,0);
+   if(EFI_ERROR(status) || !Parent)return EFI_NOT_FOUND;
+   status=Metadata(Parent,TRUE,0);if(EFI_ERROR(status))return status;
+   for(UINTN slot=0;slot<100;slot++) {
+@@ -90,7 +144,8 @@
+     if(status!=EFI_NOT_FOUND)return status;
+     status=Run->Open(Run,&Report,L"REPORT.TXT",EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE|EFI_FILE_MODE_CREATE,0);
+     if(EFI_ERROR(status) || !Report)return EFI_DEVICE_ERROR;
+-    GuLog("RTX3080 UEFI unlock experiment v0.10\nRUN%02u\nBus Master protocol state checks; hardware fix unproven; one manual attempt per launch.\n",(unsigned)slot);
++    GuLog("RTX3090TI UEFI unlock experiment v0.12 (profile port)\nRUN%02u\nvolume=%s\nBus Master protocol state checks; hardware fix unproven; one attempt per launch.\n",
++      (unsigned)slot,route==1?"usb":"internal-esp");
+     GuLogText("PIO readback is not an execution gate. This path does not independently verify TCM contents; FWSEC scratch/WPR results are required.\n");
+     return GuLogReady()?EFI_SUCCESS:EFI_DEVICE_ERROR;
+   }
+
+diff --git a/unlock/compat.c b/unlock/compat.c
+--- a/unlock/compat.c
++++ b/unlock/compat.c
+@@ -84,6 +84,11 @@
+ void pci_release_region(struct pci_dev *D,int Bar) {(void)D;(void)Bar; /* App releases PCI protocol after all cleanup. */}
+ int aperture_remove_conflicting_pci_devices(struct pci_dev *D,const char *Name) {
+   (void)D;(void)Name;
++  /* The UEFI port performs this removal before the transaction: on the
++     single-GPU profile the firmware display driver was released and the card
++     claimed exclusively. Re-probing the console here would fail only because
++     the removal already succeeded. */
++  if(Gu.console_released)return 0;
+   if(Gu.display_check)Gu.display_ok=Gu.display_check();
+   return Gu.display_ok?0:-EBUSY;
+ }
+
+diff --git a/unlock/ownership.c b/unlock/ownership.c
+--- a/unlock/ownership.c
++++ b/unlock/ownership.c
+@@ -66,14 +66,25 @@
+       Owner->agent=e->AgentHandle;drivers++;
+     }
+   }
+-  if(drivers!=1 || Owner->agent==Gu.image || Owner->agent==Gu.handle || ConsoleHandle(Table,Owner->agent))return EFI_ACCESS_DENIED;
++  if(drivers!=1 || Owner->agent==Gu.image || Owner->agent==Gu.handle ||
++    (ConsoleHandle(Table,Owner->agent) && !GU_PROFILE_RELEASE_CONSOLE_DRIVER))return EFI_ACCESS_DENIED;
++  /* The authored machine kept the console on another adapter, so a console
++     owner was proof of a mistake. On a single-GPU machine the console driver is
++     the only releasable owner, and it is exactly what must go before the FLR. */
++  if(Log && GU_PROFILE_RELEASE_CONSOLE_DRIVER)
++    GuLog("release owner is the driver bound to the console GPU; screen output ends at the release\n");
+   for(UINTN i=0;i<count;i++) {
+     const EFI_OPEN_PROTOCOL_INFORMATION_ENTRY *e=&records[i].entry;
+     if(Passive(e->Attributes))continue;
+     /* This release handles a single device driver only. DisconnectController
+        gathers children across every protocol, and physical console children
+        need not equal the System Table's virtual console handles. Refuse all
+-       child relationships instead of assuming a route alone proves isolation. */
++       child relationships instead of assuming a route alone proves isolation.
++       An exception is the console display driver on a single-GPU machine: the
++       child handles it opened on this card are precisely the surface that is
++       being torn down, and the profile accepts that the console dies with it. */
++    if(GU_PROFILE_RELEASE_CONSOLE_DRIVER && e->Attributes==EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER &&
++       e->AgentHandle==Owner->agent && e->OpenCount==1)continue;
+     if(e->Attributes!=EFI_OPEN_PROTOCOL_BY_DRIVER || e->AgentHandle!=Owner->agent ||
+        e->ControllerHandle!=Gu.handle || e->OpenCount!=1) {
+       if(Log)GuLog("release refused: active child, different owner or unsupported open at record %u\n",(unsigned)i);
+@@ -83,14 +94,24 @@
+   EFI_DRIVER_BINDING_PROTOCOL *binding=NULL;EFI_LOADED_IMAGE_PROTOCOL *image=NULL;
+   status=Gu.bs->HandleProtocol(Owner->agent,&BindingGuid,(VOID **)&binding);
+   if(EFI_ERROR(status) || !binding || binding->DriverBindingHandle!=Owner->agent || !binding->Stop ||
+-    !binding->ImageHandle || binding->ImageHandle==Gu.image)return EFI_UNSUPPORTED;
++    !binding->ImageHandle || binding->ImageHandle==Gu.image) {
++    if(Log)GuLog("release refused: unusable driver binding status=%#llx\n",(unsigned long long)status);
++    return EFI_UNSUPPORTED;
++  }
+   status=Gu.bs->HandleProtocol(binding->ImageHandle,&LoadedGuid,(VOID **)&image);
+-  if(EFI_ERROR(status) || !image)return EFI_UNSUPPORTED;
++  if(EFI_ERROR(status) || !image) {
++    if(Log)GuLog("release refused: driver loaded image unavailable status=%#llx\n",(unsigned long long)status);
++    return EFI_UNSUPPORTED;
++  }
+   if(Log)GuLog("release candidate: agent=%#llx image=%#llx source=%#llx base=%#llx bytes=%llu version=%#x code_type=%u children=0\n",
+     (unsigned long long)(UINTN)Owner->agent,(unsigned long long)(UINTN)binding->ImageHandle,
+     (unsigned long long)(UINTN)image->DeviceHandle,(unsigned long long)(UINTN)image->ImageBase,
+     (unsigned long long)image->ImageSize,binding->Version,(unsigned)image->ImageCodeType);
+-  if(!image->ImageBase || !image->ImageSize || image->ImageSize>64U*1024U*1024U || image->ImageCodeType!=EfiBootServicesCode)return EFI_UNSUPPORTED;
++  if(!image->ImageBase || !image->ImageSize || image->ImageSize>64U*1024U*1024U || image->ImageCodeType!=EfiBootServicesCode) {
++    if(Log)GuLog("release refused: driver image base=%#llx bytes=%llu code_type=%u\n",
++      (unsigned long long)(UINTN)image->ImageBase,(unsigned long long)image->ImageSize,(unsigned)image->ImageCodeType);
++    return EFI_UNSUPPORTED;
++  }
+   Owner->image=binding->ImageHandle;Owner->base=image->ImageBase;Owner->size=image->ImageSize;
+   Owner->version=binding->Version;Owner->stop=binding->Stop;return EFI_SUCCESS;
+ }
+
+diff --git a/unlock/vendor/unlock_610.c b/unlock/vendor/unlock_610.c
+--- a/unlock/vendor/unlock_610.c
++++ b/unlock/vendor/unlock_610.c
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Modified 2026-10-18 for RTX 3080 UEFI: target selection, checked IO, execution/quiescence hooks and diagnostics. See THIRD_PARTY_NOTICES.md.
++ * Modified 2026-10-20 for RTX 3090 Ti: device ID comes from board_profile.h; the
++ * unlock sequence itself is unchanged.
+  * Pre-driver V67 unlock, run before the stock driver binds: FWSEC-FRTS from
+  * the board ROM, Booter with the V67 signature, the SS0/SS1 selector writes, then
+  * FLR so the stock driver starts from a clean, halted GSP.
+@@ -20,13 +22,16 @@
+ #include "unlock_610.h"
+ #include "vbios_610.h"
+ 
+-#ifndef GU_TARGET_PCI_ID
+-#define GU_TARGET_PCI_ID 0x220410deU
+-#endif
+ #ifdef GU_UEFI_PORT
+ #include "../port.h"
+ #endif
+ 
++/* GU_TARGET_PCI_ID is supplied by board_profile.h (via port.h) in the UEFI
++   port. The Linux build keeps the upstream default. */
++#ifndef GU_TARGET_PCI_ID
++#define GU_TARGET_PCI_ID 0x220410deU
++#endif
++
+ #define SEC2_BASE 0x00840000u
+ #define SEC2_FBIF 0x00840600u
+ #define SEC2_FALCON2 0x00841000u
+
+diff --git a/probe_app.c b/probe_app.c
+--- a/probe_app.c
++++ b/probe_app.c
+@@ -4,6 +4,8 @@
+ #include <Protocol/SimpleFileSystem.h>
+ #include <Protocol/GraphicsOutput.h>
+ #include <Guid/FileInfo.h>
++#include <Guid/GlobalVariable.h>
++#include "unlock/sha256.h"
+ 
+ static EFI_GUID PciGuid = EFI_PCI_IO_PROTOCOL_GUID;
+ static EFI_GUID LoadedGuid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
+@@ -31,6 +33,60 @@
+ static VOID Say(CHAR16 *S) {
+   if (St->ConOut && St->ConOut->OutputString) St->ConOut->OutputString(St->ConOut, S);
+ }
++/* "<key>=<actual> expected=<expected> status=match|DIFFERS". */
++static VOID Verdict(const CHAR8 *Key, UINT64 Actual, UINT64 Expected) {
++  static const CHAR8 Digits[] = "0123456789abcdef";
++  INTN I;
++  Text(Key); Text("=0x");
++  for (I = 60; I >= 0; I -= 4) { CHAR8 S[2] = {Digits[(Actual >> I) & 15], 0}; Text(S); }
++  Text(" expected=0x");
++  for (I = 60; I >= 0; I -= 4) { CHAR8 S[2] = {Digits[(Expected >> I) & 15], 0}; Text(S); }
++  Text(Actual == Expected ? " status=match\r\n" : " status=DIFFERS\r\n");
++}
++static VOID HashText(const CHAR8 *Key, const UINT8 Digest[32]) {
++  static const CHAR8 Digits[] = "0123456789abcdef";
++  UINTN I;
++  Text(Key); Text("=");
++  for (I = 0; I < 32; I++) {
++    CHAR8 Pair[3] = {Digits[Digest[I] >> 4], Digits[Digest[I] & 15], 0};
++    Text(Pair);
++  }
++  Text("\r\n");
++}
++static VOID Define(const CHAR8 *Name, UINT64 Value) {
++  static const CHAR8 Digits[] = "0123456789abcdef";
++  INTN I;
++  Text("#define "); Text(Name); Text(" 0x");
++  for (I = 28; I >= 0; I -= 4) { CHAR8 S[2] = {Digits[(Value >> I) & 15], 0}; Text(S); }
++  Text("U\r\n");
++}
++static VOID SampleVerdict(const CHAR8 *Key, const PROBE_RESULT *Result,
++                          UINT32 Offset, UINT64 Expected) {
++  UINT32 Value = 0;
++  if (!ProbeSample(Result, Offset, &Value)) {
++    Text(Key); Text("=unreadable\r\n");
++    return;
++  }
++  Verdict(Key, Value, Expected);
++}
++/* Live values copied from the card, formatted for board_profile.h. */
++static VOID PasteBlock(const PROBE_RESULT *Result, UINT64 Bus, UINT64 Device,
++                       UINT64 Function) {
++  UINT32 Value = 0;
++  Text("[PASTE-READY board_profile.h values]\r\n");
++  Define("GU_BOARD_SUBSYSTEM", Result->Config[0x2c / 4]);
++  Define("GU_BOARD_REVISION", Result->Config[2] & 0xffU);
++  if (ProbeSample(Result, 0x000000, &Value)) Define("GU_BOARD_CHIP", Value);
++  Define("GU_BOARD_BUS", Bus);
++  Define("GU_BOARD_DEVICE", Device);
++  Define("GU_BOARD_FUNCTION", Function);
++  Define("GU_BOARD_BAR0_BASE", Result->BarRangeMin);
++  Define("GU_BOARD_CFG_C8", Result->Config[0xc8 / 4]);
++  if (ProbeSample(Result, 0x823804, &Value)) Define("GU_BOARD_COLD_PLM", Value);
++  if (ProbeSample(Result, 0x82381c, &Value)) Define("GU_BOARD_COLD_SS0", Value);
++  if (ProbeSample(Result, 0x1183a4, &Value)) Define("GU_BOARD_COLD_1183A4", Value);
++  Text("[PASTE-READY lines above; prom_sha256 is separate]\r\n");
++}
+ static VOID ShowLog(VOID) {
+   CHAR16 Line[128];
+   UINTN I = 0;
+@@ -41,14 +97,15 @@
+   }
+ }
+ 
+-/* Bounded walk of firmware-owned device-path nodes, without opening controllers. */
+-static BOOLEAN PathHasUsb(EFI_HANDLE Handle, BOOLEAN Record) {
++/* Bounded walk of firmware-owned device-path nodes, without opening controllers.
++   0 = not a trusted volume, 1 = USB, 2 = internal EFI System Partition. */
++static INTN PathKind(EFI_HANDLE Handle, BOOLEAN Record) {
+   EFI_DEVICE_PATH_PROTOCOL *Path = NULL;
+   UINTN Total = 0, Nodes = 0;
+   BOOLEAN Usb = FALSE;
+   EFI_STATUS Status = St->BootServices->HandleProtocol(Handle, &PathGuid, (VOID **)&Path);
+   if (Record) Hex("device_path_status", Status);
+-  if (EFI_ERROR(Status) || Path == NULL) return FALSE;
++  if (EFI_ERROR(Status) || Path == NULL) return 0;
+   while (Nodes++ < 64 && Total + 4 <= 4096) {
+     UINTN Length = Path->Length[0] | ((UINTN)Path->Length[1] << 8);
+     UINTN I;
+@@ -65,15 +122,20 @@
+       }
+       Text("\r\n");
+     }
+-    if (Path->Type == END_DEVICE_PATH_TYPE)
+-      return Usb && Length == 4 && Path->SubType == END_ENTIRE_DEVICE_PATH_SUBTYPE;
++    if (Path->Type == END_DEVICE_PATH_TYPE) {
++      if (Length != 4 || Path->SubType != END_ENTIRE_DEVICE_PATH_SUBTYPE) return 0;
++      if (Usb) return 1;
++      return GU_PROFILE_ALLOW_INTERNAL_ESP ? 2 : 0;
++    }
+     Total += Length;
+     Path = (EFI_DEVICE_PATH_PROTOCOL *)((UINT8 *)Path + Length);
+   }
+-  return FALSE; /* Malformed or unterminated path is never an output destination. */
++  return 0; /* Malformed or unterminated path is never an output destination. */
+ }
+ 
+-/* Only a USB-loaded image with our existing marker directory can create files. */
++/* Only an image loaded from a trusted volume -- USB, or the internal ESP when
++     GU_PROFILE_ALLOW_INTERNAL_ESP is set -- with the marker directory present
++     may create files. */
+ static EFI_FILE_PROTOCOL *OpenOutput(EFI_HANDLE Image) {
+   EFI_LOADED_IMAGE_PROTOCOL *Loaded = NULL;
+   EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Fs = NULL;
+@@ -85,17 +147,21 @@
+   Status = St->BootServices->HandleProtocol(Image, &LoadedGuid, (VOID **)&Loaded);
+   Hex("loaded_image_status", Status);
+   if (EFI_ERROR(Status) || Loaded == NULL) return NULL;
+-  if (!PathHasUsb(Loaded->DeviceHandle, TRUE)) {
+-    Text("output=disabled: loaded image device is not a verified USB path\r\n");
+-    return NULL;
++  {
++    INTN Kind = PathKind(Loaded->DeviceHandle, TRUE);
++    Hex("output_volume", Kind);
++    if (Kind == 0) {
++      Text("output=disabled: loaded image device is not a trusted volume\r\n");
++      return NULL;
++    }
+   }
+   Status = St->BootServices->HandleProtocol(Loaded->DeviceHandle, &FsGuid, (VOID **)&Fs);
+-  Hex("usb_filesystem_status", Status);
++  Hex("output_filesystem_status", Status);
+   if (EFI_ERROR(Status) || Fs == NULL) return NULL;
+   Status = Fs->OpenVolume(Fs, &Root);
+-  Hex("usb_open_volume_status", Status);
++  Hex("output_open_volume_status", Status);
+   if (EFI_ERROR(Status) || Root == NULL) return NULL;
+-  Status = Root->Open(Root, &Parent, L"\\RTX3080-PROBE",
++  Status = Root->Open(Root, &Parent, GU_PROFILE_PROBE_DIR,
+                       EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
+   Root->Close(Root);
+   Hex("probe_directory_status", Status);
+@@ -156,13 +222,14 @@
+     Hex("mode", Gop->Mode->Mode);
+     Hex("framebuffer_base", Gop->Mode->FrameBufferBase);
+     Hex("framebuffer_size", Gop->Mode->FrameBufferSize);
++    Hex("is_console", Handles[I] == St->ConsoleOutHandle);
+     if (Gop->Mode->Info) {
+       Hex("width", Gop->Mode->Info->HorizontalResolution);
+       Hex("height", Gop->Mode->Info->VerticalResolution);
+       Hex("pixels_per_scanline", Gop->Mode->Info->PixelsPerScanLine);
+       Hex("pixel_format", Gop->Mode->Info->PixelFormat);
+     }
+-    PathHasUsb(Handles[I], TRUE);
++    PathKind(Handles[I], TRUE);
+   }
+   if (Handles) St->BootServices->FreePool(Handles);
+ }
+@@ -173,13 +240,23 @@
+   EFI_PCI_IO_PROTOCOL *Selected = NULL;
+   EFI_FILE_PROTOCOL *Output;
+   UINTN Count = 0, I, Matches = 0;
++  UINTN TargetBus = 0, TargetDevice = 0, TargetFunction = 0;
+   EFI_STATUS Status;
+   PROBE_RESULT Result;
+   St = Table; Bs = St->BootServices; Used = 0; Log[0] = 0;
+-  Say(L"\r\nRTX 3080 read-only diagnostic v0.1\r\n");
+-  Say(L"Collects BIOS and preboot state. This does not unlock the GPU.\r\n");
+-  Text("RTX3080 read-only diagnostic v0.1\r\n");
+-  Text("Expected PCI 10de:2206 subsystem 1462:3890\r\n");
++  Say(L"\r\nRTX 3090 Ti read-only profile v0.2\r\n");
++  Say(L"Collects BIOS and preboot state. This does not unlock or write the GPU.\r\n");
++  Text("RTX3090TI read-only profile v0.2 (Windows/UEFI port)\r\n");
++  Text("Target profile: " GU_PROFILE_NAME "\r\n");
++  Text("Expected PCI 10de:2203 class 0x030000\r\n");
++  {
++    EFI_GUID Global = EFI_GLOBAL_VARIABLE;
++    UINT8 Secure = 0xff;
++    UINTN SecureSize = 1;
++    Status = St->RuntimeServices->GetVariable(L"SecureBoot", &Global, NULL, &SecureSize, &Secure);
++    Hex("secure_boot_status", Status);
++    Hex("secure_boot_enabled", (!EFI_ERROR(Status) && SecureSize == 1) ? Secure : 0xff);
++  }
+   Output = OpenOutput(Image);
+   Status = Bs->LocateHandleBuffer(ByProtocol, &PciGuid, NULL, &Count, &Handles);
+   Hex("pci_enumeration_status", Status);
+@@ -198,15 +275,19 @@
+       Hex("device", Device); Hex("function", Function);
+       Hex("identity", Config[0]); Hex("class_revision", Config[2]);
+       Hex("subsystem", Config[11]);
+-      if (ProbeMatches(Config)) { Matches++; Selected = Pci; SelectedHandle = Handles[I]; }
++      Hex("profile_mismatch_mask", ProbeProfileMismatches(Config));
++      if (ProbeMatches(Config)) {
++        Matches++; Selected = Pci; SelectedHandle = Handles[I];
++        TargetBus = Bus; TargetDevice = Device; TargetFunction = Function;
++      }
+     }
+   }
+   if (Handles) Bs->FreePool(Handles);
+   Hex("matching_cards", Matches);
+   RecordGop();
+   if (Matches == 1) {
+-    Say(L"Expected MSI RTX 3080 found. Reading its existing state...\r\n");
+-    Text("[TARGET]\r\n"); PathHasUsb(SelectedHandle, TRUE);
++    Say(L"Target RTX 3090 Ti found. Reading its existing state...\r\n");
++    Text("[TARGET]\r\n"); PathKind(SelectedHandle, TRUE);
+     Status = ProbeCollect(Selected, Bs, &Result);
+     Hex("collect_status", Status);
+     if (!EFI_ERROR(Status)) {
+@@ -220,11 +301,32 @@
+             (Sample->Value == 0xffffffff || (Sample->Value & 0xffff0000U) == 0xbadf0000U))
+           Text("interpretation=inaccessible, not a valid measurement\r\n");
+       }
++      Verdict("target_bdf_bus", TargetBus, GU_BOARD_BUS);
++      Verdict("target_bdf_device", TargetDevice, GU_BOARD_DEVICE);
++      Verdict("target_bdf_function", TargetFunction, GU_BOARD_FUNCTION);
++      Text("[PROFILE]\r\n");
++      Verdict("pci_device", Result.Config[0] >> 16, GU_PROFILE_PCI_DEVICE);
++      Verdict("subsystem", Result.Config[0x2c / 4], GU_BOARD_SUBSYSTEM);
++      Verdict("revision", Result.Config[2] & 0xffU, GU_BOARD_REVISION);
++      if (GU_BOARD_CFG_C8 == GU_BOARD_CFG_C8_ANY) {
++        Hex("config_c8", Result.Config[0xc8 / 4]); Text("config_c8_expected=any\r\n");
++      } else Verdict("config_c8", Result.Config[0xc8 / 4], GU_BOARD_CFG_C8);
++      if (GU_BOARD_BAR0_BASE == GU_BOARD_BAR0_ANY) {
++        Hex("bar0_base", Result.BarRangeMin); Text("bar0_base_expected=any\r\n");
++      } else Verdict("bar0_base", Result.BarRangeMin, GU_BOARD_BAR0_BASE);
++      Hex("bar0_granularity", Result.BarGranularity);
++      Hex("bar0_translation", Result.BarTranslation);
++      SampleVerdict("chip", &Result, 0x000000, GU_BOARD_CHIP);
++      SampleVerdict("cold_plm", &Result, 0x823804, GU_BOARD_COLD_PLM);
++      SampleVerdict("cold_ss0", &Result, 0x82381c, GU_BOARD_COLD_SS0);
++      SampleVerdict("cold_ss1", &Result, 0x823820, 0);
++      SampleVerdict("cold_1183a4", &Result, 0x1183a4, GU_BOARD_COLD_1183A4);
++      PasteBlock(&Result, TargetBus, TargetDevice, TargetFunction);
+       Hex("rom_image_size", Selected->RomSize);
+       if (Output && ProbeRomUsable(Selected->RomImage, Selected->RomSize)) {
+         Status = Save(Output, L"ROMIMAGE.BIN", Selected->RomImage, (UINTN)Selected->RomSize);
+         Hex("rom_image_save_status", Status);
+-      } else Text("rom_image=not saved (no writable USB or missing/invalid firmware ROM copy)\r\n");
++      } else Text("rom_image=not saved (no writable output volume or invalid firmware ROM copy)\r\n");
+       if (Output && Result.MemoryEnabled && !EFI_ERROR(Result.BarStatus) &&
+           Result.BarSize >= PROBE_PROM_OFFSET + PROBE_PROM_SIZE) {
+         VOID *Prom = NULL;
+@@ -235,6 +337,14 @@
+           Status = ProbeReadProm(Selected, &Result, Prom, PROBE_PROM_SIZE);
+           Hex("prom_read_status", Status);
+           if (!EFI_ERROR(Status) && ProbeRomUsable(Prom, PROBE_PROM_SIZE)) {
++            UINT8 Digest[32];
++            GuSha256(Prom, PROBE_PROM_SIZE, Digest);
++            HashText("prom_sha256", Digest);
++            if (GU_BOARD_PROM_SHA256[0])
++              Text(GuHashMatches(Prom, PROBE_PROM_SIZE, GU_BOARD_PROM_SHA256) ?
++                   "prom_profile=match\r\n" : "prom_profile=DIFFERS\r\n");
++            else
++              Text("prom_profile=unset: paste prom_sha256 into GU_BOARD_PROM_SHA256\r\n");
+             Status = Save(Output, L"PROM.BIN", Prom, PROBE_PROM_SIZE);
+             Hex("prom_save_status", Status);
+           } else Text("prom=not saved (read error or no 55aa ROM signature)\r\n");
+@@ -244,7 +354,7 @@
+     }
+   } else {
+     Text("target=missing or ambiguous; no GPU MMIO or ROM reads attempted\r\n");
+-    Say(L"Expected card missing or ambiguous. No GPU MMIO reads attempted.\r\n");
++    Say(L"Target card missing or ambiguous. No GPU MMIO reads attempted.\r\n");
+   }
+   Text("GPU writes=none; GPU resets=none; boot-variable changes=none\r\n");
+   Status = Save(Output, L"REPORT.TXT", Log, Used);
+@@ -252,7 +362,7 @@
+   if (EFI_ERROR(Status)) {
+     Say(L"Could not save report. Diagnostic details follow:\r\n");
+     Hex("report_save_status", Status); ShowLog();
+-  } else Say(L"Saved: USB \\RTX3080-PROBE\\RUNxx\\REPORT.TXT and available BIOS copies.\r\n");
++  } else Say(L"Saved: \\RTX3090TI-PROBE\\RUNxx\\REPORT.TXT on the boot volume; other copies listed above.\r\n");
+   Say(L"Returning in 15 seconds. Choose Windows Boot Manager if a boot menu appears.\r\n");
+   Bs->Stall(15000000);
+   return EFI_SUCCESS;
+
+diff --git a/probe_core.c b/probe_core.c
+--- a/probe_core.c
++++ b/probe_core.c
+@@ -1,5 +1,7 @@
+ #include "probe_core.h"
+ 
++/* Offsets the unlocker actually gates on, plus the surrounding
++   fuse/WPR/engine state the author recorded on the reference card. */
+ static const UINT32 Offsets[PROBE_SAMPLE_COUNT] = {
+   0x000000, 0x118128, 0x118234, 0x110100, 0x1fa824, 0x1fa828,
+   0x823804, 0x82381c, 0x823820, 0x1183a4, 0x625f04, 0x1fa7c8,
+@@ -7,8 +9,32 @@
+ };
+ 
+ BOOLEAN ProbeMatches(const UINT32 *Config) {
+-  return Config != NULL && Config[0] == 0x220610de &&
+-         Config[11] == 0x38901462 && (Config[2] >> 24) == 3;
++  return Config != NULL && (Config[0] & 0xffffU) == 0x10deU &&
++         (Config[0] >> 16) == GU_PROFILE_PCI_DEVICE &&
++         (Config[2] >> 24) == 3U;
++}
++
++UINT32 ProbeProfileMismatches(const UINT32 *Config) {
++  UINT32 Mismatch = 0;
++  if (Config == NULL) return 0xffffffffU;
++  if (Config[0x2c / 4] != GU_BOARD_SUBSYSTEM) Mismatch |= PROBE_MISMATCH_SUBSYSTEM;
++  if ((Config[2] & 0xffU) != GU_BOARD_REVISION) Mismatch |= PROBE_MISMATCH_REVISION;
++  if ((Config[2] >> 24) != 3U) Mismatch |= PROBE_MISMATCH_CLASS;
++  return Mismatch;
++}
++
++BOOLEAN ProbeSample(const PROBE_RESULT *Result, UINT32 Offset, UINT32 *Value) {
++  UINTN I;
++  if (Result == NULL) return FALSE;
++  for (I = 0; I < PROBE_SAMPLE_COUNT; I++) {
++    if (Result->Samples[I].Offset == Offset) {
++      if (EFI_ERROR(Result->Samples[I].Status) || Result->Samples[I].Value == 0xffffffffU)
++        return FALSE;
++      if (Value != NULL) *Value = Result->Samples[I].Value;
++      return TRUE;
++    }
++  }
++  return FALSE;
+ }
+ 
+ EFI_STATUS ProbeCollect(EFI_PCI_IO_PROTOCOL *Pci, EFI_BOOT_SERVICES *Bs,
+@@ -30,6 +56,11 @@
+       Status = EFI_COMPROMISED_DATA;
+     } else {
+       Result->BarSize = Descriptor->AddrLen;
++      Result->BarRangeMin = Descriptor->AddrRangeMin;
++      Result->BarRangeMax = Descriptor->AddrRangeMax;
++      Result->BarGranularity = Descriptor->AddrSpaceGranularity;
++      Result->BarTranslation = Descriptor->AddrTranslationOffset;
++      Result->BarResType = Descriptor->ResType;
+     }
+   }
+   if (Descriptor != NULL) Bs->FreePool(Descriptor);
+
+diff --git a/probe_core.h b/probe_core.h
+--- a/probe_core.h
++++ b/probe_core.h
+@@ -2,12 +2,19 @@
+ #include <Uefi.h>
+ #include <Protocol/PciIo.h>
+ #include <IndustryStandard/Acpi10.h>
++#include "unlock/board_profile.h"
+ 
+ #define PROBE_SAMPLE_COUNT 16
+ #define PROBE_PROM_OFFSET 0x00300000ULL
+ #define PROBE_PROM_SIZE 0x00100000U
+ #define PROBE_ROM_LIMIT 0x01000000U
+ 
++/* Comparison of a live value against unlock/board_profile.h. */
++#define PROBE_MISMATCH_SUBSYSTEM 0x1U
++#define PROBE_MISMATCH_REVISION 0x2U
++#define PROBE_MISMATCH_CLASS 0x4U
++#define PROBE_MISMATCH_BDF 0x8U
++
+ typedef struct {
+   UINT32 Offset;
+   UINT32 Value;
+@@ -17,14 +24,29 @@
+ typedef struct {
+   UINT32 Config[64];
+   UINT64 BarSize;
++  UINT64 BarRangeMin;
++  UINT64 BarRangeMax;
++  UINT64 BarGranularity;
++  UINT64 BarTranslation;
++  UINT8 BarResType;
+   EFI_STATUS BarStatus;
+   BOOLEAN MemoryEnabled;
+   PROBE_SAMPLE Samples[PROBE_SAMPLE_COUNT];
+ } PROBE_RESULT;
+ 
++/* Target selection is device + vendor + display class, never the subsystem:
++   the subsystem differs per board partner and must be *reported*, not
++   demanded, or the profiler would refuse to read the very card it profiles. */
+ BOOLEAN ProbeMatches(const UINT32 *Config);
++
++/* Bitmask of PROBE_MISMATCH_* for the values the profile also pins. */
++UINT32 ProbeProfileMismatches(const UINT32 *Config);
++
+ EFI_STATUS ProbeCollect(EFI_PCI_IO_PROTOCOL *Pci, EFI_BOOT_SERVICES *Bs,
+                        PROBE_RESULT *Result);
+ EFI_STATUS ProbeReadProm(EFI_PCI_IO_PROTOCOL *Pci, const PROBE_RESULT *Result,
+                         VOID *Buffer, UINTN Size);
+ BOOLEAN ProbeRomUsable(const VOID *Buffer, UINT64 Size);
++
++/* Look up a sampled register value. Returns FALSE when it was not readable. */
++BOOLEAN ProbeSample(const PROBE_RESULT *Result, UINT32 Offset, UINT32 *Value);
+
