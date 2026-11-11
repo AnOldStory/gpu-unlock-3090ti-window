@@ -32,8 +32,9 @@
 #define GU_BOARD_CHIP 0xb72000a1U
 
 /* ---------------------------------------------------------------- location */
-/* Where this firmware placed the card. MEASURED 0000:06:00.0. */
-#define GU_BOARD_BUS 6U
+/* Where this firmware placed the card. MEASURED 0000:07:00.0 (firmware
+ * renumbered this slot from bus 6 to bus 7; same physical path, same card). */
+#define GU_BOARD_BUS 7U
 #define GU_BOARD_DEVICE 0U
 #define GU_BOARD_FUNCTION 0U
 

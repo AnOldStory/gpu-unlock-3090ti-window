@@ -469,7 +469,7 @@ static VOID app_fail(const char *expression,const char *file,int line) {
   exit(1);
 }
 int main(int argc,char **argv) {
-  CHECK(argc==4 || argc==5);size_t n;UINT8 *data=read_file(argv[1],&n);CHECK(n==sizeof(prom));memcpy(prom,data,n);free(data);
+  CHECK(argc==4 || argc==5);size_t n;UINT8 *data=read_file(argv[1],&n);CHECK(n==sizeof(prom));memcpy(prom,data,n);free(data);prom_loaded=TRUE;
   const char *names[]={"booter_load_ga102.bin","v67-ga102-610.43.03.bin","gsp_ga10x.bin","gsp_boot_ga102.bin","gsp_boot_desc_ga102.bin"};
   for(int i=0;i<5;i++) {
     char path[1024];snprintf(path,sizeof(path),"%s/%s",argv[2],names[i]);
