@@ -45,7 +45,8 @@ build_app() {
   done
   echo "LD  unlock/build/BOOTX64.EFI"
   "$LD" -mi386pep -nostdlib -e efi_main --subsystem 10 --image-base 0 \
-    --enable-reloc-section -o "$out/BOOTX64.EFI" "${objs[@]}"
+    --dynamicbase --nxcompat --high-entropy-va \
+    --enable-reloc-section -Map "$out/BOOTX64.map" -o "$out/BOOTX64.EFI" "${objs[@]}"
 }
 
 build_profile() {
@@ -60,6 +61,7 @@ build_profile() {
   done
   echo "LD  build/TI_PROFILE.EFI"
   "$LD" -mi386pep -nostdlib -e efi_main --subsystem 10 --image-base 0 \
+    --dynamicbase --nxcompat --high-entropy-va \
     --enable-reloc-section -o "$out/TI_PROFILE.EFI" "${objs[@]}"
 }
 

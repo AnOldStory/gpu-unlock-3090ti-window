@@ -117,7 +117,8 @@ static EFI_STATUS Metadata(EFI_FILE_PROTOCOL *File,BOOLEAN Directory,UINTN Expec
   return EFI_SUCCESS;
 }
 EFI_STATUS GuIoOpen(EFI_HANDLE Image,EFI_SYSTEM_TABLE *St) {
-  Table=St;Root=Parent=Run=Report=NULL;LogFault=FALSE;memset(GuAssets,0,sizeof(GuAssets));
+  Table=St;Root=Parent=Run=Report=NULL;LogFault=FALSE;ConsoleMuted=FALSE;
+  memset(GuAssets,0,sizeof(GuAssets));
   EFI_LOADED_IMAGE_PROTOCOL *loaded=NULL;EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs=NULL;
   EFI_STATUS status=Table->BootServices->HandleProtocol(Image,&LoadedGuid,(VOID **)&loaded);
   int route=loaded?TrustedPath(loaded->DeviceHandle):0;

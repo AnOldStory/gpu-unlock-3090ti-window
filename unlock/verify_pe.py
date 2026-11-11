@@ -25,10 +25,24 @@ def inspect(path, map_path):
     require(struct.unpack_from('<Q', data, optional+24)[0] == 0, 'expected image base 0')
     require(u16(optional+70) & 0x140 == 0x140, 'ASLR and NX flags required')
     require(u32(optional+108) >= 16, 'data directory missing')
-    for index, name in [(1, 'imports'), (12, 'IAT'), (13, 'delay imports')]:
-        require(data[optional+112+8*index:optional+120+8*index] == b'\0'*8, name)
-    require(u32(optional+112+8*5+4) != 0, 'relocations missing')
     table = optional+u16(pe+20)
+    def file_offset(rva):
+        for i in range(u16(pe+6)):
+            at = table+40*i
+            if u32(at+12) <= rva < u32(at+12)+u32(at+8):
+                return u32(at+20)+(rva-u32(at+12))
+        return None
+    for index, name in [(1, 'imports'), (12, 'IAT'), (13, 'delay imports')]:
+        rva = u32(optional+112+8*index)
+        size = u32(optional+112+8*index+4)
+        if not rva:
+            continue
+        # GNU ld emits a stub .idata holding only the zero terminator record.
+        offset = file_offset(rva)
+        require(offset is not None, f'{name} directory outside sections')
+        require(data[offset:offset+size] == b'\0'*size,
+                f'{name} directory has entries')
+    require(u32(optional+112+8*5+4) != 0, 'relocations missing')
     executable_entry = False
     for i in range(u16(pe+6)):
         at = table+40*i
@@ -37,6 +51,9 @@ def inspect(path, map_path):
     require(executable_entry, 'entry must be in executable section')
     text = Path(map_path).read_text()
     found = re.search(r'^\s*[0-9A-Fa-f]+:[0-9A-Fa-f]+\s+efi_main\s+([0-9A-Fa-f]+)', text, re.M)
+    if not found:
+        # GNU ld maps print absolute VMAs; with --image-base 0 they equal RVAs.
+        found = re.search(r'^\s*0x0*([0-9A-Fa-f]+)\s+efi_main\s*$', text, re.M)
     require(found and int(found[1], 16) == entry, 'entry does not match efi_main map symbol')
     return dict(path=Path(path).name, bytes=len(data), sha256=hashlib.sha256(data).hexdigest(),
                 machine='AMD64', subsystem=10, entry='efi_main', entry_rva=entry,

@@ -15,6 +15,7 @@
 #include "../compat/compat.h"
 #include "../vendor/unlock_610.h"
 #include "../vendor/prep_610.h"
+#include "../vendor/vbios_610.h"
 
 #ifndef GU_UEFI_PORT
 #error This integration test must execute the real UEFI compatibility path.
@@ -32,6 +33,7 @@ enum scenario {
   MAP_FAIL, MAP_PARTIAL, RESTORE_FAIL, DISPLAY_CHANGED, SELECTOR_LOST,
   FWSEC_NO_WPR, FWSEC_RUNNING, DIAG_READ_FAIL, POST_DIAG_READ_FAIL,
   PIO_UNAVAILABLE, PIO_UNAVAILABLE_NO_WPR, FWSEC_ERROR_CODE,
+  SEC2_TIMEOUT, SELECTOR_FAIL,
   SCENARIO_COUNT
 };
 static const char *case_names[]={"success","fwsec-timeout","post-flr-gfw-timeout",
@@ -39,7 +41,8 @@ static const char *case_names[]={"success","fwsec-timeout","post-flr-gfw-timeout
   "unmap-failure","map-failure","partial-map","pci-restore-failure","display-changed","selector-lost",
   "fwsec-halted-no-wpr","fwsec-running-then-halt",
   "fwsec-prestart-snapshot-failure","fwsec-posthalt-snapshot-failure",
-  "pio-unavailable-fwsec-success","pio-unavailable-fwsec-no-wpr","fwsec-error-code"};
+  "pio-unavailable-fwsec-success","pio-unavailable-fwsec-no-wpr","fwsec-error-code",
+  "sec2-launch-timeout","selector-write-lost"};
 typedef struct {VOID *cpu;UINTN bytes;UINT64 dma;BOOLEAN mapped,freed;} TEST_BUFFER;
 typedef struct {VOID *cpu;BOOLEAN freed;} TEST_POOL;
 static TEST_BUFFER buffers[MAX_BUFFERS];
@@ -109,11 +112,17 @@ static UINT8 *dma_pointer(UINT64 address,UINTN bytes) {
   CHECK(address!=(UINT64)(UINTN)b->cpu+(address-b->dma));
   fake.dma_reads++;return (UINT8 *)b->cpu+(UINTN)(address-b->dma);
 }
+/* FWSEC geometry varies between board ROMs; the fixture parses the loaded
+   PROM instead of pinning the authored card's offsets. */
+static struct gpu_unlock_fwsec fixture_fw;
+static UINT32 fixture_sig_at;
+static BOOLEAN prom_loaded;
 static VOID check_fwsec_image(void) {
   UINT64 last_source=((UINT64)registers[(GSP+0x110)/4]<<8)|((UINT64)registers[(GSP+0x128)/4]<<40);
-  CHECK(last_source>=0xdf00);UINT8 *image=dma_pointer(last_source-0xdf00,0xe700);
-  CHECK(!memcmp(gsp_dmem,image+0xdf00,sizeof(gsp_dmem)));
-  CHECK(!memcmp(gsp_dmem+0x5a4,prom+0x43060+0x300,384));
+  CHECK(last_source>=fixture_fw.data_off);
+  UINT8 *image=dma_pointer(last_source-fixture_fw.data_off,fixture_fw.image_size);
+  CHECK(!memcmp(gsp_dmem,image+fixture_fw.data_off,sizeof(gsp_dmem)));
+  CHECK(!memcmp(gsp_dmem+fixture_fw.pkc_off,prom+fixture_fw.sig_off+fixture_sig_at,384));
   CHECK(le32(gsp_dmem+0x7c0+32)==0x27fe00);
   CHECK(le32(gsp_dmem+0x7c0+36)==0x100);
 }
@@ -208,8 +217,12 @@ static EFI_STATUS EFIAPI write_config(EFI_PCI_IO_PROTOCOL *p,EFI_PCI_IO_PROTOCOL
   UINT32 trace_value=0;memcpy(&trace_value,value,bytes);trace_write(1,(UINT32)width,offset,trace_value);
   fake.pci_writes++;memcpy(config+offset,value,bytes);
   if(offset==0x80 && width==EfiPciIoWidthUint16 && (*(UINT16 *)value&0x8000)) {
-    CHECK(!(config[4]&4) && fake.gsp_starts==1 && fake.sec2_starts==1);
-    CHECK(!fake.unmaps && !fake.frees);check_stock_signature();
+    CHECK(!(config[4]&4));
+    /* Abort FLR may run before SEC2 ever launched, so only the BME-clear and
+       no-early-free invariants hold here; publication state gates the
+       signature check, not the engine-start counts. */
+    CHECK(!fake.unmaps && !fake.frees);
+    if(fake.meta_dma)check_stock_signature();
     fake.flrs++;CHECK(fake.flrs==1);fake.delay_since_flr=0;
     memset(config+0x10,0,24);config[4]=0;config[0x80]=config[0x81]=0;
     registers[(GSP+0x3c0)/4]=registers[(SEC2+0x3c0)/4]=0;
@@ -251,7 +264,10 @@ static EFI_STATUS EFIAPI write_memory(EFI_PCI_IO_PROTOCOL *p,EFI_PCI_IO_PROTOCOL
   UINT8 bar,UINT64 offset,UINTN count,VOID *value) {
   CHECK(p==&pci && !bar && width==EfiPciIoWidthUint32 && count==1);quiet_check();
   CHECK(offset+4<=sizeof(registers) && Gu.started);
-  UINT32 v=*(UINT32 *)value;registers[offset/4]=v;fake.mmio_writes++;
+  UINT32 v=*(UINT32 *)value;
+  /* SELECTOR_FAIL absorbs the SS0 write so the readback mismatches. */
+  if(fake.mode!=SELECTOR_FAIL || offset!=SS0)registers[offset/4]=v;
+  fake.mmio_writes++;
   trace_write(0,(UINT32)width,(UINT32)offset,v);
   CHECK(offset!=GSP+0x1c4); /* Diagnostics must never write firmware data. */
   if(offset==GSP+0x1c0) {
@@ -280,7 +296,9 @@ static EFI_STATUS EFIAPI write_memory(EFI_PCI_IO_PROTOCOL *p,EFI_PCI_IO_PROTOCOL
   }
   if(offset==SEC2+0x100 || offset==SEC2+0x130) {
     fake.sec2_starts++;CHECK(fake.sec2_starts==1 && (config[4]&4));
-    check_booter_publication();registers[PLM/4]=~0U;
+    check_booter_publication();
+    /* SEC2_TIMEOUT leaves FEAT PLM closed so the launch wait times out. */
+    if(fake.mode!=SEC2_TIMEOUT)registers[PLM/4]=~0U;
   }
   if(offset==SS1)registers[offset/4]=v&15;
   return EFI_SUCCESS;
@@ -322,7 +340,7 @@ static VOID setup(enum scenario mode) {
   pci.AllocateBuffer=allocate_buffer;pci.FreeBuffer=free_buffer;pci.Map=map_buffer;pci.Unmap=unmap_buffer;
   pci.Pci.Read=read_config;pci.Pci.Write=write_config;pci.Mem.Read=read_memory;pci.Mem.Write=write_memory;pci.Flush=flush;
   pci.Attributes=master_attributes;fake.pci_attributes=EFI_PCI_IO_ATTRIBUTE_IO|EFI_PCI_IO_ATTRIBUTE_MEMORY;
-  *(UINT32 *)(config+0)=0x220610de;*(UINT32 *)(config+0x2c)=0x38901462;
+  *(UINT32 *)(config+0)=0x220310de;*(UINT32 *)(config+0x2c)=0x50911462;
   *(UINT32 *)(config+4)=0x00100003;*(UINT32 *)(config+8)=0x030000a1;*(UINT32 *)(config+12)=0x00800010;
   *(UINT32 *)(config+0x10)=0x84000000;*(UINT32 *)(config+0x14)=0xc;*(UINT32 *)(config+0x18)=0x60;
   *(UINT32 *)(config+0x1c)=0xc;*(UINT32 *)(config+0x20)=0x64;*(UINT32 *)(config+0x24)=0x5001;
@@ -342,6 +360,16 @@ static VOID setup(enum scenario mode) {
   registers[(GSP+0x1c0)/4]=0x40;
   registers[(GSP+0x94)/4]=0x12345678;
   memcpy((UINT8 *)registers+0x300000,prom,sizeof(prom));
+  /* FWSEC geometry varies between board ROMs; parse the loaded PROM once,
+     then resolve the signature index from the fuse register the transaction
+     reads so the image check stays consistent with it. Suites that never
+     load a PROM (master-attributes) skip the resolution entirely. */
+  if(prom_loaded) {
+    if(!fixture_fw.sig_versions)CHECK(!gpu_unlock_vbios_fwsec(prom,sizeof(prom),&fixture_fw));
+    CHECK(!gpu_unlock_fwsec_sig_offset(fixture_fw.sig_versions,
+          gpu_unlock_fuse_version(registers[(0x008241c0+(fixture_fw.ucode_id-1)*4)/4]),
+          384,&fixture_sig_at));
+  }
   GuInit(&bs,&pci);Gu.bar_base=0x84000000;Gu.bar_size=sizeof(registers);
   Gu.pcie_cap=0x78;Gu.pcie_version=2;Gu.pm_cap=0x60;Gu.msi_cap=0x68;Gu.msix_cap=0;
   Gu.owned=Gu.armed=Gu.display_ok=TRUE;Gu.display_check=display_check;
@@ -364,7 +392,7 @@ static VOID load_fixture_assets(const char *prom_path,const char *assets_path) {
   static const char *full_names[]={"gpu-unlock/610.43.03/booter_load_ga102.bin",
     "gpu-unlock/610.43.03/v67-ga102-610.43.03.bin","gpu-unlock/610.43.03/gsp_ga10x.bin",
     "gpu-unlock/610.43.03/gsp_boot_ga102.bin","gpu-unlock/610.43.03/gsp_boot_desc_ga102.bin"};
-  size_t length;UINT8 *rom=read_file(prom_path,&length);CHECK(length==sizeof(prom));memcpy(prom,rom,length);free(rom);
+  size_t length;UINT8 *rom=read_file(prom_path,&length);CHECK(length==sizeof(prom));memcpy(prom,rom,length);free(rom);prom_loaded=TRUE;
   for(UINTN i=0;i<5;i++) {
     char path[4096];int count=snprintf(path,sizeof(path),"%s/%s",assets_path,names[i]);
     CHECK(count>0 && (size_t)count<sizeof(path));GuAssets[i].name=full_names[i];
@@ -400,26 +428,41 @@ int main(int argc,char **argv) {
       CHECK(fake.live_maps==fake.maps && fake.live_buffers==fake.buffer_count && Gu.allocations);
       CHECK(fake.unmaps==1 && !fake.frees && fake.pool_live);
       CHECK(fake.gsp_starts==1 && fake.sec2_starts==1 && fake.flrs==1);
-    } else {
-      CHECK(result && !safe && Gu.started && !Gu.quiesced && Gu.retained);
-      CHECK(fake.live_maps==fake.maps && fake.live_buffers==fake.buffer_count && Gu.allocations);
-      CHECK(!fake.unmaps && !fake.frees);
-      if(mode==FWSEC_TIMEOUT)CHECK(fake.gsp_starts==1 && !fake.sec2_starts && !fake.flrs && fake.elapsed>=5000000);
-      if(mode==MMIO_WRITE_FAIL || mode==FLUSH_FAIL)CHECK(!fake.gsp_starts && !fake.sec2_starts && !fake.flrs);
-      if(mode==POST_FLR_TIMEOUT || mode==FLR_WRITE_FAIL || mode==RESTORE_FAIL)CHECK(fake.flrs==1 && fake.delay_since_flr>=100000);
-      if(mode==DISPLAY_CHANGED)CHECK(fake.gsp_starts==1 && fake.sec2_starts==1 && !fake.flrs);
+    } else if(mode==FWSEC_TIMEOUT || mode==FWSEC_NO_WPR || mode==PIO_UNAVAILABLE_NO_WPR ||
+              mode==FWSEC_ERROR_CODE || mode==SEC2_TIMEOUT || mode==SELECTOR_FAIL) {
+      /* Started-but-failed with a clean abort FLR: quiescence is proven, the
+         buffers come back and the post-reset card is safe to hand off. The
+         original error is still returned; only containment changed. */
+      CHECK(result && safe && Gu.started && Gu.quiesced && !Gu.fault && !Gu.retained);
+      CHECK(!fake.live_maps && !fake.live_buffers && !Gu.allocations && !fake.pool_live);
+      CHECK(fake.unmaps==fake.maps && fake.frees==fake.buffer_count);
+      CHECK(fake.flrs==1 && (registers[0x110100/4]&0x10) && !(registers[0x1fa828/4]>>4));
+      CHECK(strstr(fake.log,"abort containment complete:") &&
+            strstr(fake.log,"abort containment: result=0 quiesced=1"));
+      if(mode==FWSEC_TIMEOUT || mode==SEC2_TIMEOUT)CHECK(fake.elapsed>=5000000);
+      if(mode==FWSEC_TIMEOUT || mode==FWSEC_NO_WPR || mode==PIO_UNAVAILABLE_NO_WPR ||
+         mode==FWSEC_ERROR_CODE)CHECK(fake.gsp_starts==1 && !fake.sec2_starts);
+      if(mode==SEC2_TIMEOUT || mode==SELECTOR_FAIL)CHECK(fake.gsp_starts==1 && fake.sec2_starts==1);
       if(mode==FWSEC_NO_WPR || mode==PIO_UNAVAILABLE_NO_WPR) {
-        CHECK(fake.gsp_starts==1 && !fake.sec2_starts && !fake.flrs);
         CHECK(registers[SS0/4]==0x46254040 && registers[SS1/4]==3);
         CHECK(strstr(fake.log,"FWSEC halt observation:") && strstr(fake.log,"observed_nonhalt=0"));
         CHECK(strstr(fake.log,"FWSEC snapshot: phase=post-halt") && strstr(fake.log,"value=0x12345678"));
       }
-      if(mode==DIAG_READ_FAIL)CHECK(!fake.gsp_starts && !fake.sec2_starts && !fake.flrs && Gu.fault);
-      if(mode==POST_DIAG_READ_FAIL)CHECK(Gu.fault && fake.gsp_starts==1 && !fake.sec2_starts && !fake.flrs);
       if(mode==FWSEC_ERROR_CODE) {
-        CHECK(result==-EIO && fake.gsp_starts==1 && !fake.sec2_starts && !fake.flrs);
+        CHECK(result==-EIO);
         CHECK(strstr(fake.log,"FWSEC result: scratch=0x10000"));
       }
+      /* SS0 is verified before SS1 is touched, so both stay at stock values. */
+      if(mode==SELECTOR_FAIL)CHECK(registers[SS0/4]==0x46254040 && registers[SS1/4]==3);
+    } else {
+      CHECK(result && !safe && Gu.started && !Gu.quiesced && Gu.retained);
+      CHECK(fake.live_maps==fake.maps && fake.live_buffers==fake.buffer_count && Gu.allocations);
+      CHECK(!fake.unmaps && !fake.frees);
+      if(mode==MMIO_WRITE_FAIL || mode==FLUSH_FAIL)CHECK(!fake.gsp_starts && !fake.sec2_starts && !fake.flrs);
+      if(mode==POST_FLR_TIMEOUT || mode==FLR_WRITE_FAIL || mode==RESTORE_FAIL)CHECK(fake.flrs==1 && fake.delay_since_flr>=100000);
+      if(mode==DISPLAY_CHANGED)CHECK(fake.gsp_starts==1 && fake.sec2_starts==1 && !fake.flrs);
+      if(mode==DIAG_READ_FAIL)CHECK(!fake.gsp_starts && !fake.sec2_starts && !fake.flrs && Gu.fault);
+      if(mode==POST_DIAG_READ_FAIL)CHECK(Gu.fault && fake.gsp_starts==1 && !fake.sec2_starts && !fake.flrs);
     }
     /* App-level containment must work even when the normal I/O path is fault-latched. */
     CHECK(!EFI_ERROR(GuClearMaster()) && !(config[4]&4));

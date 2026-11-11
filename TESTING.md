@@ -22,7 +22,7 @@ python -m unittest discover -s tools -p "test_*.py" -v
 다음 파일을 준비한 뒤 `-WithLocalFixtures`를 지정합니다.
 
 - `analysis/pinned-assets/`: `unlock/assets.json`의 5개 자산.
-- `evidence/boot-03/PROM.BIN`: 1MiB, SHA256 `F3DC8F07B0B8C9856D192DF172DFA7F7F84AC17EF6EDFDB448AD7FA94EFD2789`.
+- `evidence/boot-03/PROM.BIN`: 1MiB, SHA256 `52D6246160F2D0721AF5F203BA47AC0323381A35517799AFF2D507D30F6F502B` (GA102-350 카드의 ROM 덤프; 다른 덤프를 쓰려면 `unlock/tests/test_sha256.c`의 핀도 맞춰야 합니다).
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\unlock\test-all.ps1 -WithLocalFixtures

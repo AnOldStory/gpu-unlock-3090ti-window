@@ -449,7 +449,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE Image,EFI_SYSTEM_TABLE *St) {
   LogContainment();
   GuLog("transaction result=%d containment=%#llx started=%u quiesced=%u fault=%u retained=%u maps=%u FLR=%u\n",
     result,(unsigned long long)contained,Gu.started,Gu.quiesced,Gu.fault,Gu.retained,Gu.dma_count,Gu.flrs);
-  if(EFI_ERROR(contained) || !GuSafeToReturn() || Gu.allocations || (Gu.started && result))Halt();
+  /* A failed transaction whose abort FLR proved quiescence is contained:
+     continue to the handoff instead of stopping the boot. */
+  if(EFI_ERROR(contained) || !GuSafeToReturn() || Gu.allocations || (Gu.started && result && !Gu.quiesced))Halt();
   gpu_unlock_610_release_shared(&shared);Gu.armed=FALSE;
   status=result?EFI_DEVICE_ERROR:EFI_SUCCESS;
   if(!result) {
@@ -457,7 +459,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE Image,EFI_SYSTEM_TABLE *St) {
     EFI_STATUS cleared=GuMarkFailedWrite(FALSE);
     GuLog("attempt marker cleared=%u\n",(unsigned)!EFI_ERROR(cleared));
   }
-  if(!EFI_ERROR(status) && Gu.console_released) {
+  /* Also runs after a contained failure so the released console comes back
+     before Windows; the selector readback shows whether the unlock stuck. */
+  if(GuSafeToReturn() && Gu.console_released) {
     /* RUN01 reached the end of the transaction and then never handed off: the
        firmware boot menu and Windows Boot Manager both need a graphics console,
        and the display driver was released for the FLR. Reconnect it so the
@@ -481,7 +485,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE Image,EFI_SYSTEM_TABLE *St) {
     }
   }
 finish:
-  if(release_attempted && (EFI_ERROR(status) || Gu.fault))ReleaseHalt(status,attempted);
+  /* ReleaseHalt exists for unproven containment; a contained failure keeps
+     the card and lets the handoff continue to Windows instead. */
+  if(release_attempted && (EFI_ERROR(status) || Gu.fault) && !GuSafeToReturn())ReleaseHalt(status,attempted);
   if(attempted && !GuSafeToReturn())Halt();
   if(GuLogReady())GuLog("FINAL status=%#llx stage=%s attempted=%u driver_release=%u clean=%u\n",(unsigned long long)status,Stage,attempted,release_attempted,GuSafeToReturn());
   else GuConsole("Preflight or logging failed; no new attempt will start.\n");
@@ -495,6 +501,7 @@ finish:
   }
   GuReleaseAssets();
   if(!EFI_ERROR(status))GuConsole("UEFI transaction completed and cleaned up. Returning to firmware; Windows validation is pending.\n");
+  else if(attempted)GuConsole("Attempt failed after firmware started; the card was reset and contained. Continuing to Windows; the next boot still asks for U before retrying.\n");
   else if(WarmBoot)GuConsole("Not a cold boot; nothing was changed. Continuing to Windows.\n");
   else GuConsole("Attempt cancelled or rejected. Returning without another attempt.\n");
   return status;

@@ -23,8 +23,18 @@ int main(int argc,char **argv) {
       CHECK(!fake.live_maps && !fake.live_buffers);
     } else {
       CHECK(result==(modes[i]==FWSEC_TIMEOUT?-ETIMEDOUT:-EIO));
+#ifdef GU_TRACE_V06
+      /* v0.6 predates failure containment: a started-but-failed transaction
+         could only retain everything and stop. */
       CHECK(!GuSafeToReturn() && Gu.retained && !fake.sec2_starts && !fake.flrs);
       CHECK(fake.live_maps==fake.maps && !fake.unmaps && !fake.frees);
+#else
+      /* Started firmware is re-contained by the abort FLR, which appends the
+         same bounded reset sequence the success path uses. Dead fixture PIO
+         does not block it: containment rides the PCI config and BAR paths. */
+      CHECK(GuSafeToReturn() && !Gu.retained && Gu.quiesced && !fake.sec2_starts && fake.flrs==1);
+      CHECK(!fake.live_maps && !fake.live_buffers);
+#endif
       CHECK(registers[SS0/4]==0x46254040 && registers[SS1/4]==3);
     }
     CHECK(!EFI_ERROR(GuClearMaster()) && !(config[4]&4));

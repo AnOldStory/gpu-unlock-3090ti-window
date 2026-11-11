@@ -6,6 +6,11 @@
 #undef main
 #undef GuLog
 #undef GuLogText
+/* Assertion failures inside this file carry the app-mode name, not the
+   transaction-fixture mode that the shared fail() would print. */
+static VOID app_fail(const char *expression,const char *file,int line);
+#undef CHECK
+#define CHECK(x) ((x)?(void)0:app_fail(#x,__FILE__,__LINE__))
 #include "../app.h"
 #include <Protocol/LoadedImage.h>
 #include <Protocol/SimpleFileSystem.h>
@@ -79,11 +84,13 @@ static EFI_GUID pg=EFI_PCI_IO_PROTOCOL_GUID,lg=EFI_LOADED_IMAGE_PROTOCOL_GUID,
   dg=EFI_DEVICE_PATH_PROTOCOL_GUID,fg=EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID,
   gg=EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID,ig=EFI_FILE_INFO_ID,bg=EFI_DRIVER_BINDING_PROTOCOL_GUID;
 static const UINT8 intel_path[]={2,1,12,0,0xd0,0x41,3,0xa,0,0,0,0,1,1,6,0,0,2,2,3,8,0,0x11,0x43,1,0x80,0x7f,0xff,4,0};
-static const UINT8 rtx_path[]={2,1,12,0,0xd0,0x41,3,0xa,0,0,0,0,1,1,6,0,0,1,1,1,6,0,0,0,0x7f,0xff,4,0};
+/* Measured on this machine: PciRoot(0)/Pci(3,1)/Pci(0,0)/AcpiAdr(0x80010300). */
+static const UINT8 rtx_path[]={2,1,12,0,0xd0,0x41,3,0xa,0,0,0,0,1,1,6,0,1,3,1,1,6,0,0,0,2,3,8,0,0,3,1,0x80,0x7f,0xff,4,0};
 static UINT8 usb_path[]={3,5,6,0,1,0,0x7f,0xff,4,0};
 #define H(n) ((EFI_HANDLE)(UINTN)(n))
 typedef struct {EFI_FILE_PROTOCOL protocol;int kind;UINTN position;BOOLEAN open;} FILE_FAKE;
-static FILE_FAKE files[9]; /* root, parent, run, report, five assets */
+static FILE_FAKE files[10]; /* root, parent, run, report, five assets, marker */
+static BOOLEAN marker_present;
 static GU_ASSET originals[5];
 static UINT32 captured_config[64];
 static UINTN exclusive_calls,close_protocol_calls,key_calls,watchdog_calls,report_bytes,file_closes;
@@ -91,7 +98,7 @@ static UINTN query_calls;
 static VOID *query_allocation;
 static char report_text[262144];
 static EFI_TPL current_tpl;
-static BOOLEAN exclusive,halted,key_sent,key_reset,prompt,run_created,owner_raced;
+static BOOLEAN exclusive,halted,key_sent,key_reset,prompt,run_created,owner_raced,countdown,auto_armed;
 static jmp_buf escape_halt;
 static int guid(EFI_GUID *a,EFI_GUID *b){return !memcmp(a,b,sizeof(*a));}
 static void narrow(char *d,UINTN n,CHAR16 *s){UINTN i=0;while(i+1<n && s[i]){d[i]=(char)s[i];i++;}d[i]=0;}
@@ -99,6 +106,8 @@ static EFI_STATUS EFIAPI app_output(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *p,CHAR16 *s
   CHECK(p==&conout);char text[2048];narrow(text,sizeof(text),s);
   UINTN used=strlen(fake.log),n=strlen(text);if(n<sizeof(fake.log)-used)memcpy(fake.log+used,text,n+1);
   if(strstr(fake.log,"Press U to attempt"))prompt=TRUE;
+  if(strstr(fake.log,"AUTO: starting"))countdown=TRUE;
+  if(strstr(fake.log,"AUTO: starting in 1 s"))auto_armed=TRUE;
   if(strstr(fake.log,"POWER OFF"))halted=TRUE;
   return EFI_SUCCESS;
 }
@@ -107,13 +116,20 @@ static EFI_STATUS EFIAPI input_reset(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *p,BOOLEAN e
 }
 static EFI_STATUS EFIAPI read_key(EFI_SIMPLE_TEXT_INPUT_PROTOCOL *p,EFI_INPUT_KEY *key) {
   CHECK(p==&conin);key_calls++;
-  if(!prompt || key_sent || app_mode==APP_TIMEOUT || app_mode==APP_OLD_KEY || app_mode==APP_HANDOFF_TIMEOUT)return EFI_NOT_READY;
+  if((!prompt && !countdown) || key_sent || app_mode==APP_TIMEOUT || app_mode==APP_OLD_KEY || app_mode==APP_HANDOFF_TIMEOUT)return EFI_NOT_READY;
+  /* Automatic arming aborts on any key; only the cancel cases press one, and
+     only while the countdown is still open. */
+  if(countdown && !prompt && app_mode!=APP_ESCAPE && app_mode!=APP_HANDOFF_ESCAPE)return EFI_NOT_READY;
   BOOLEAN cancel=app_mode==APP_ESCAPE || app_mode==APP_HANDOFF_ESCAPE;
   CHECK(key_reset);key_sent=TRUE;key->ScanCode=cancel?0x17:0;
   key->UnicodeChar=cancel?0:'U';return EFI_SUCCESS;
 }
 static EFI_STATUS EFIAPI app_stall(UINTN n) {
-  if(halted)longjmp(escape_halt,1);return stall(n);
+  /* Halt() marks resources retained before its endless stall, and GuLog lands
+     in fake.log even when a muted console drops the text, so either signal is
+     enough for the fixture to escape the loop. */
+  if(halted || Gu.retained || strstr(fake.log,"POWER OFF")){halted=TRUE;longjmp(escape_halt,1);}
+  return stall(n);
 }
 static EFI_STATUS EFIAPI watchdog(UINTN timeout,UINT64 code,UINTN bytes,CHAR16 *data) {
   CHECK(!timeout && !code && !bytes && !data);watchdog_calls++;
@@ -183,7 +199,7 @@ static EFI_STATUS EFIAPI open_info(EFI_HANDLE h,EFI_GUID *g,EFI_OPEN_PROTOCOL_IN
     CHECK(!EFI_ERROR(allocate_pool(EfiLoaderData,*n*sizeof(**e),(VOID **)e)));
     (*e)[0].Attributes=EFI_OPEN_PROTOCOL_BY_DRIVER;
     if(bound) {
-      (*e)[0].AgentHandle=app_mode==APP_HANDOFF_CHANGED && key_sent?H(11):H(8);
+      (*e)[0].AgentHandle=app_mode==APP_HANDOFF_CHANGED && (key_sent || auto_armed)?H(11):H(8);
       if(disconnect_calls && app_mode==APP_HANDOFF_REBIND)(*e)[0].AgentHandle=H(11);
       (*e)[0].ControllerHandle=H(3);(*e)[0].OpenCount=1;
       if(*n==2) {
@@ -212,7 +228,7 @@ static EFI_STATUS EFIAPI stale_read(EFI_PCI_IO_PROTOCOL *p,EFI_PCI_IO_PROTOCOL_W
 }
 static EFI_STATUS EFIAPI disconnect(EFI_HANDLE h,EFI_HANDLE agent,EFI_HANDLE child) {
   CHECK(h==H(3) && agent==H(8) && agent!=owner_binding.ImageHandle && !child);
-  CHECK(current_tpl==TPL_APPLICATION && key_sent && prompt && key_reset && !disconnect_calls && !exclusive);
+  CHECK(current_tpl==TPL_APPLICATION && ((key_sent && prompt) || auto_armed) && key_reset && !disconnect_calls && !exclusive);
   CHECK(GuAssets[4].firmware.data && !fake.mmio_writes && !fake.flrs && !fake.maps);
   CHECK(strstr(report_text,"release RTX firmware driver"));disconnect_calls++;
   if(app_mode==APP_HANDOFF_FAIL){config[4]|=4;return EFI_DEVICE_ERROR;}
@@ -242,7 +258,8 @@ static EFI_STATUS EFIAPI close_protocol(EFI_HANDLE h,EFI_GUID *g,EFI_HANDLE agen
   CHECK(GuSafeToReturn() && !Gu.allocations);exclusive=FALSE;close_protocol_calls++;return EFI_SUCCESS;
 }
 static EFI_STATUS EFIAPI location(EFI_PCI_IO_PROTOCOL *p,UINTN *s,UINTN *b,UINTN *d,UINTN *f) {
-  CHECK(p==&pci || p==&replacement_pci);*s=*d=*f=0;*b=1;return EFI_SUCCESS;
+  CHECK(p==&pci || p==&replacement_pci);*s=0;*b=GU_BOARD_BUS;*d=GU_BOARD_DEVICE;*f=GU_BOARD_FUNCTION;
+  return EFI_SUCCESS;
 }
 static EFI_STATUS EFIAPI replacement_read(EFI_PCI_IO_PROTOCOL *p,EFI_PCI_IO_PROTOCOL_WIDTH w,UINT32 o,UINTN n,VOID *d) {
   CHECK(p==&replacement_pci);return read_config(&pci,w,o,n,d);
@@ -311,7 +328,7 @@ static EFI_STATUS EFIAPI file_close(EFI_FILE_PROTOCOL *f){
 static EFI_STATUS EFIAPI file_open(EFI_FILE_PROTOCOL *f,EFI_FILE_PROTOCOL **out,CHAR16 *name,UINT64 mode,UINT64 attributes) {
   FILE_FAKE *v=(FILE_FAKE *)f;char path[128];narrow(path,sizeof(path),name);CHECK(v->open);*out=NULL;
   int target=-1;
-  if(v->kind==0 && !strcmp(path,"\\RTX3080-UNLOCK"))target=1;
+  if(v->kind==0 && !strcmp(path,"\\RTX3090TI-UNLOCK"))target=1;
   else if(v->kind==1 && !strncmp(path,"RUN",3)) {
     CHECK(!strcmp(path,"RUN00") || !strcmp(path,"RUN01") || !strcmp(path,"RUN02"));
     if(strcmp(path,"RUN02"))target=2;
@@ -320,6 +337,10 @@ static EFI_STATUS EFIAPI file_open(EFI_FILE_PROTOCOL *f,EFI_FILE_PROTOCOL **out,
   } else if(v->kind==2 && !strcmp(path,"REPORT.TXT")) {
     if(!(mode&EFI_FILE_MODE_CREATE))return EFI_NOT_FOUND;
     CHECK(run_created && !report_bytes);target=3;
+  } else if(v->kind==1 && !strcmp(path,"UNFINISHED.TXT")) {
+    if(mode&EFI_FILE_MODE_CREATE)marker_present=TRUE;
+    else if(!marker_present)return EFI_NOT_FOUND;
+    target=9;
   } else if(v->kind==1) {
     for(int i=0;i<5;i++) {
       const char *base=strrchr(originals[i].name,'/')+1;
@@ -342,9 +363,14 @@ static EFI_STATUS EFIAPI file_read(EFI_FILE_PROTOCOL *f,UINTN *n,VOID *data) {
   if(app_mode==APP_BAD_HASH && !v->position && *n)((UINT8 *)data)[0]^=1;
   v->position+=*n;return EFI_SUCCESS;
 }
+static EFI_STATUS EFIAPI file_delete(EFI_FILE_PROTOCOL *f) {
+  FILE_FAKE *v=(FILE_FAKE *)f;CHECK(v->open && v->kind==9);
+  v->open=FALSE;marker_present=FALSE;return EFI_SUCCESS;
+}
 static EFI_STATUS EFIAPI file_write(EFI_FILE_PROTOCOL *f,UINTN *n,VOID *data) {
   CHECK(current_tpl==TPL_APPLICATION);
-  FILE_FAKE *v=(FILE_FAKE *)f;CHECK(v->open && v->kind==3 && data);
+  FILE_FAKE *v=(FILE_FAKE *)f;CHECK(v->open && (v->kind==3 || v->kind==9) && data);
+  if(v->kind==9)return EFI_SUCCESS;
   if(app_mode==APP_SHORT_WRITE && *n)(*n)--;
   if(app_mode==APP_LOG_DIRTY && Gu.started)return EFI_DEVICE_ERROR;
   if(app_mode==APP_FWSEC_DIAG_LOG && !strncmp(data,"FWSEC snapshot: phase=pre-start",30))return EFI_DEVICE_ERROR;
@@ -368,6 +394,10 @@ static void app_setup(enum app_case mode) {
   setup(mode==APP_BME || mode==APP_HANDOFF_BME?BME_READBACK_FAIL:mode==APP_DIRTY?FWSEC_TIMEOUT:mode==APP_UNMAP?UNMAP_FAIL:mode==APP_SELECTOR?SELECTOR_LOST:
     mode==APP_FWSEC_NO_WPR?PIO_UNAVAILABLE_NO_WPR:mode==APP_FWSEC_PIO_UNAVAILABLE?PIO_UNAVAILABLE:SUCCESS);
   app_mode=mode;memcpy(config,captured_config,sizeof(config));
+  /* The captured space came from the RTX 3080 diagnostic run; keep its BAR,
+     capability and power state shape but present the 3090 Ti identity the
+     profile targets. */
+  *(UINT32 *)(config+0)=0x220310de;*(UINT32 *)(config+0x2c)=0x50911462;
   memset(&st,0,sizeof(st));memset(&rt,0,sizeof(rt));memset(files,0,sizeof(files));memset(&loaded,0,sizeof(loaded));
   exclusive_calls=close_protocol_calls=key_calls=watchdog_calls=report_bytes=file_closes=0;
   query_calls=0;query_allocation=NULL;
@@ -379,7 +409,7 @@ static void app_setup(enum app_case mode) {
   owner_image.ImageBase=mode==APP_HANDOFF_IMAGE?NULL:(VOID *)(UINTN)0x800000;
   owner_image.ImageSize=0x20000;owner_image.ImageCodeType=EfiBootServicesCode;owner_image.ImageDataType=EfiBootServicesData;owner_image.DeviceHandle=H(3);
   memset(report_text,0,sizeof(report_text));
-  exclusive=halted=key_sent=key_reset=prompt=run_created=owner_raced=FALSE;current_tpl=TPL_APPLICATION;
+  exclusive=halted=key_sent=key_reset=prompt=run_created=owner_raced=countdown=auto_armed=FALSE;current_tpl=TPL_APPLICATION;
   st.BootServices=&bs;st.RuntimeServices=&rt;st.ConOut=&conout;st.ConIn=&conin;
   st.ConsoleOutHandle=mode==APP_QUERY_OTHER_CONSOLE?H(7):H(6);
   rt.GetVariable=get_variable;conout.OutputString=app_output;conin.Reset=input_reset;conin.ReadKeyStroke=read_key;
@@ -391,11 +421,13 @@ static void app_setup(enum app_case mode) {
   pci.Pci.Read=app_read_config;pci.Attributes=mode==APP_DECODE_NO_API?NULL:attributes;
   replacement_pci=pci;replacement_pci.Pci.Read=replacement_read;replacement_pci.Pci.Write=replacement_write;
   loaded.DeviceHandle=H(2);fs.OpenVolume=volume;
-  for(int i=0;i<9;i++) {
+  for(int i=0;i<10;i++) {
     files[i].kind=i;files[i].protocol.Open=file_open;files[i].protocol.Close=file_close;
     files[i].protocol.GetInfo=file_info;files[i].protocol.Read=file_read;
     files[i].protocol.Write=file_write;files[i].protocol.Flush=file_flush;
+    files[i].protocol.Delete=file_delete;
   }
+  marker_present=FALSE;
   for(int i=0;i<2;i++) {
     memset(&modes[i],0,sizeof(modes[i]));memset(&infos[i],0,sizeof(infos[i]));
     memset(&gops[i],0,sizeof(gops[i]));gops[i].Mode=&modes[i];gops[i].QueryMode=query_mode;
@@ -428,6 +460,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image,EFI_SYSTEM_TABLE *table){(void)image
 VOID GuLog(const char *f,...){(void)f;}
 VOID GuLogText(const char *s){(void)s;}
 #endif
+/* Expectation failures also dump the report tail, which is where the app's
+   own log went. */
+static VOID app_fail(const char *expression,const char *file,int line) {
+  fprintf(stderr,"APP ASSERTION FAILED [%s] %s:%d: %s\n",app_names[app_mode],file,line,expression);
+  size_t length=strlen(report_text);
+  fprintf(stderr,"%s",report_text+(length>6000?length-6000:0));
+  exit(1);
+}
 int main(int argc,char **argv) {
   CHECK(argc==4 || argc==5);size_t n;UINT8 *data=read_file(argv[1],&n);CHECK(n==sizeof(prom));memcpy(prom,data,n);free(data);
   const char *names[]={"booter_load_ga102.bin","v67-ga102-610.43.03.bin","gsp_ga10x.bin","gsp_boot_ga102.bin","gsp_boot_desc_ga102.bin"};
@@ -448,26 +488,40 @@ int main(int argc,char **argv) {
     if(!setjmp(escape_halt))result=efi_main(H(1),&st);
     if(mode==APP_SUCCESS || mode==APP_OWNER_RACE || mode==APP_EDK2_BAR || mode==APP_ZERO_INFO ||
        mode==APP_QUERY_FORWARD || mode==APP_QUERY_FORWARD_REVERSED || mode==APP_HANDOFF ||
-       mode==APP_HANDOFF_CONFIG || mode==APP_DECODE_BOTH || mode==APP_DECODE_IO || mode==APP_FWSEC_PIO_UNAVAILABLE) {
+       mode==APP_HANDOFF_CONFIG || mode==APP_DECODE_BOTH || mode==APP_DECODE_IO || mode==APP_FWSEC_PIO_UNAVAILABLE ||
+       /* Automatic arming turns a quiet countdown into the full attempt, and
+          the single-GPU profile accepts the target card's own GOP. Children
+           opened by the console driver are torn down with it, not refused. */
+       mode==APP_TIMEOUT || mode==APP_OLD_KEY || mode==APP_HANDOFF_TIMEOUT || mode==APP_RTX_GOP ||
+       mode==APP_HANDOFF_CHILD || mode==APP_HANDOFF_BAD_CHILD || mode==APP_HANDOFF_OTHER_CHILD ||
+       mode==APP_HANDOFF_DISPLAY) {
       CHECK(result==EFI_SUCCESS && !halted && Gu.started && Gu.quiesced && !Gu.allocations);
       CHECK(fake.flrs==1 && exclusive_calls==1 && close_protocol_calls==1 && report_bytes && watchdog_calls==1);
+      CHECK(!marker_present);
       if(mode==APP_ZERO_INFO)CHECK(query_calls>=2 && strstr(report_text,"console QueryMode: status=0"));
       if(mode==APP_QUERY_FORWARD || mode==APP_QUERY_FORWARD_REVERSED)
-        CHECK(query_calls==3 && strstr(report_text,"console forwarded Intel match=1"));
+        CHECK(query_calls==3 && strstr(report_text,"console forwarded physical match=1"));
       if(mode>=APP_HANDOFF)CHECK(disconnect_calls==1 && !bound && strstr(report_text,"driver_release=1"));
       if(mode==APP_HANDOFF_CONFIG || mode==APP_DECODE_BOTH || mode==APP_DECODE_IO) {
         UINT64 expected=mode==APP_DECODE_IO?EFI_PCI_IO_ATTRIBUTE_IO:
           mode==APP_DECODE_BOTH?(EFI_PCI_IO_ATTRIBUTE_IO|EFI_PCI_IO_ATTRIBUTE_MEMORY):EFI_PCI_IO_ATTRIBUTE_MEMORY;
         CHECK(attribute_enables==1 && enabled_attributes==expected && strstr(report_text,"decode readback matched=1"));
       } else CHECK(!attribute_enables);
-    } else if(mode==APP_MASTER_ENABLE_ERROR || mode==APP_MASTER_DISABLE_ERROR || mode==APP_MASTER_ENABLE_ERROR_CLEAR_BAD) {
+    } else if(mode==APP_MASTER_ENABLE_ERROR) {
+      /* The BME enable lands in hardware, then the call reports failure: the
+         abort clears BME and frees every page, so the boot continues with the
+         retry marker left behind. */
+      CHECK(EFI_ERROR(result) && !halted && !Gu.started && !fake.flrs && Gu.fault);
+      CHECK(!Gu.retained && !Gu.allocations && !fake.live_maps && !fake.live_buffers);
+      CHECK(fake.master_enables==1 && !(config[4]&4) && disconnect_calls==1 && !bound);
+      CHECK(close_protocol_calls==1 && !exclusive && marker_present);
+      CHECK(!Gu.master_attributes_pending && !(fake.pci_attributes&EFI_PCI_IO_ATTRIBUTE_BUS_MASTER));
+      CHECK(strstr(report_text,"BME containment:"));
+    } else if(mode==APP_MASTER_DISABLE_ERROR || mode==APP_MASTER_ENABLE_ERROR_CLEAR_BAD) {
       CHECK(halted && Gu.retained && exclusive && !close_protocol_calls && !(config[4]&4));
       CHECK(fake.master_enables==1 && fake.master_disables && !fake.flrs);
       CHECK(Gu.fault && strstr(report_text,"BME containment:"));
-      if(mode==APP_MASTER_ENABLE_ERROR) {
-        CHECK(!Gu.started && !fake.mmio_writes && !fake.live_maps && !fake.live_buffers);
-        CHECK(!Gu.master_attributes_pending && !(fake.pci_attributes&EFI_PCI_IO_ATTRIBUTE_BUS_MASTER));
-      } else if(mode==APP_MASTER_DISABLE_ERROR) {
+      if(mode==APP_MASTER_DISABLE_ERROR) {
         CHECK(Gu.started && !Gu.quiesced && Gu.master_attributes_pending);
         CHECK(Gu.allocations && fake.live_maps && fake.live_buffers && !fake.unmaps && !fake.frees);
         CHECK(EFI_ERROR(Gu.master_attribute_status) && !EFI_ERROR(Gu.master_hardware_status));
@@ -477,57 +531,98 @@ int main(int argc,char **argv) {
         CHECK(!EFI_ERROR(Gu.master_attribute_status) && EFI_ERROR(Gu.master_hardware_status));
         CHECK((config[4]&3)==1 && fake.pci_attributes==(EFI_PCI_IO_ATTRIBUTE_IO|EFI_PCI_IO_ATTRIBUTE_MEMORY));
       }
-    } else if(mode>=APP_HANDOFF_FAIL) {
+    } else if(mode==APP_HANDOFF_LOG || mode==APP_DECODE_LOG_FAIL) {
+      /* Only faults that cannot prove containment still halt the boot after a
+         driver release. */
       CHECK(halted && Gu.retained && disconnect_calls==1 && !close_protocol_calls && fake.pool_live);
       CHECK(!fake.live_buffers && !fake.live_maps && !(config[4]&4));
-      if(mode==APP_HANDOFF_CLOSE)CHECK(Gu.started && Gu.quiesced && fake.flrs==1 && exclusive);
-      else CHECK(!Gu.started && !fake.flrs && !fake.mmio_writes);
-      if(mode==APP_HANDOFF_MISSING_PCI || mode==APP_HANDOFF_LATE_MISSING)CHECK(!Gu.pci);
-      if(mode==APP_HANDOFF_REPLACED_PCI || mode==APP_HANDOFF_LATE_REPLACED)CHECK(Gu.pci==&replacement_pci);
-      if(mode>=APP_DECODE_BOTH) {
-        BOOLEAN enabled=mode==APP_DECODE_ENABLE_ERROR || mode==APP_DECODE_NOOP || mode==APP_DECODE_PARTIAL ||
-          mode==APP_DECODE_EXTRA_BME || mode==APP_DECODE_READ_FAIL || mode==APP_DECODE_ENABLE_ERROR_MATCH;
-        CHECK(attribute_enables==(UINTN)enabled);
-        if(mode!=APP_DECODE_LOG_FAIL)CHECK(strstr(report_text,"config before decode restore") && strstr(report_text,"config[00]"));
-        if(mode==APP_DECODE_ENABLE_ERROR)CHECK(strstr(report_text,"config after decode restore") && strstr(report_text,"decode readback matched=0"));
-        if(mode==APP_DECODE_ENABLE_ERROR_MATCH)CHECK(strstr(report_text,"decode readback matched=1"));
-        if(mode==APP_DECODE_READ_FAIL)CHECK(strstr(report_text,"valid_bytes=16; snapshot incomplete"));
+      CHECK(!Gu.started && !fake.flrs && !fake.mmio_writes);
+    } else if(mode==APP_HANDOFF_CLOSE) {
+      /* The transaction completed and released everything, then the report
+         close failed: the released console means the boot still halts, after
+         one last containment pass that re-marks the card retained. */
+      CHECK(halted && Gu.retained && disconnect_calls==1 && close_protocol_calls==1);
+      CHECK(Gu.started && Gu.quiesced && fake.flrs==1 && !exclusive && !(config[4]&4));
+      CHECK(!marker_present);
+    } else if(mode==APP_DIRTY || mode==APP_FWSEC_NO_WPR || mode==APP_QUERY_LATE) {
+      /* The abort FLR proved quiescence: the attempt reports failure yet still
+         returns to the boot path, with the marker left so the next boot asks
+         for U instead of retrying unattended. */
+      CHECK(EFI_ERROR(result) && !halted && Gu.started && Gu.quiesced && !Gu.fault && !Gu.retained && !Gu.allocations);
+      CHECK(fake.flrs==1 && !fake.live_maps && !fake.live_buffers && marker_present && close_protocol_calls==1);
+      CHECK(strstr(report_text,"abort containment:"));
+      if(mode!=APP_QUERY_LATE)CHECK(registers[SS0/4]==0x46254040 && registers[SS1/4]==3);
+      /* The third QueryMode fails inside the transaction; the contained
+         abort then lets the display restore query once more. */
+      else CHECK(query_calls==4);
+      if(mode==APP_FWSEC_NO_WPR) {
+        CHECK(fake.gsp_starts==1 && !fake.sec2_starts);
+        CHECK(strstr(report_text,"FWSEC snapshot: phase=post-halt") && strstr(report_text,"observed_nonhalt=0"));
       }
-    } else if(mode==APP_DIRTY || mode==APP_UNMAP || mode==APP_LOG_DIRTY || mode==APP_SELECTOR || mode==APP_QUERY_LATE ||
-              mode==APP_FWSEC_NO_WPR || mode==APP_FWSEC_DIAG_LOG) {
+    } else if(mode==APP_UNMAP || mode==APP_LOG_DIRTY || mode==APP_SELECTOR ||
+              mode==APP_FWSEC_DIAG_LOG) {
       CHECK(halted && exclusive && Gu.retained && !(config[4]&4));
       CHECK(Gu.allocations && fake.live_buffers && !close_protocol_calls);
-      if(mode==APP_QUERY_LATE)CHECK(query_calls==3 && !fake.flrs && Gu.started && !Gu.quiesced);
-      if(mode==APP_FWSEC_NO_WPR || mode==APP_FWSEC_DIAG_LOG) {
-        CHECK(!fake.sec2_starts && !fake.flrs && !fake.unmaps && !fake.frees);
-        CHECK(fake.gsp_starts==(UINTN)(mode==APP_FWSEC_NO_WPR));
+      if(mode==APP_FWSEC_DIAG_LOG) {
+        CHECK(!fake.sec2_starts && !fake.unmaps && !fake.frees && !fake.gsp_starts);
         CHECK(Gu.started && !Gu.quiesced && registers[SS0/4]==0x46254040 && registers[SS1/4]==3);
-        if(mode==APP_FWSEC_NO_WPR)CHECK(strstr(report_text,"FWSEC snapshot: phase=post-halt") && strstr(report_text,"observed_nonhalt=0"));
-        if(mode==APP_FWSEC_DIAG_LOG)CHECK(Gu.fault);
+        CHECK(Gu.fault);
       }
     } else if(mode==APP_FINAL_LOG || mode==APP_CLOSE) {
       CHECK(halted && exclusive && Gu.retained && !(config[4]&4) && !close_protocol_calls);
       CHECK(!fake.live_maps && !fake.live_buffers && fake.pool_live && Gu.quiesced);
       if(mode==APP_CLOSE)CHECK(!files[3].open && file_closes==1);
     } else {
+      /* Failures before firmware start - including a refused or unsuccessful
+         driver release - return to the boot path with the card untouched. */
       CHECK(EFI_ERROR(result) && !halted && !Gu.started && !fake.mmio_writes && !fake.flrs);
-      CHECK(!(config[4]&4) && !fake.live_maps && !fake.live_buffers);
-      if(mode!=APP_BME)CHECK(!fake.pci_writes);
+      CHECK(!fake.live_maps && !fake.live_buffers);
+      if(mode!=APP_BME && mode!=APP_HANDOFF_BME && mode!=APP_HANDOFF_FAIL &&
+         mode!=APP_DECODE_BME && mode!=APP_DECODE_EXTRA_BME && mode!=APP_DECODE_ENABLE_ERROR &&
+         /* The claim enabled BME on what turned out to be a replaced device;
+            containment refuses to write to it again. */
+         mode!=APP_HANDOFF_LATE_REPLACED)
+        CHECK(!(config[4]&4));
+      if(mode!=APP_BME && mode!=APP_HANDOFF_BME && !(mode>=APP_DECODE_BOTH && mode<=APP_DECODE_ENABLE_ERROR_MATCH))
+        CHECK(!fake.pci_writes);
       if(mode==APP_OWNER)CHECK(!exclusive_calls);
       if(mode==APP_BAR_MAX || mode==APP_BAD_BAR || mode==APP_BAD_ALIGNMENT) {
         CHECK(strstr(report_text,"stage=bar0") && strstr(report_text,"bar0 descriptor:"));
       }
       if(mode==APP_CONFIG)CHECK(strstr(report_text,"stage=target") && strstr(report_text,"config["));
-      if(mode==APP_BAD_GOP || mode==APP_RTX_GOP)CHECK(strstr(report_text,"stage=display") && strstr(report_text,"GOP["));
+      if(mode==APP_BAD_GOP)CHECK(strstr(report_text,"stage=display") && strstr(report_text,"GOP["));
+      if(mode==APP_HANDOFF_MISSING_PCI)CHECK(!Gu.pci);
+      /* A late loss leaves the stale interface pointer; only its reads fail. */
+      if(mode==APP_HANDOFF_LATE_MISSING)CHECK(Gu.pci==&pci);
+      if(mode==APP_HANDOFF_REPLACED_PCI)CHECK(Gu.pci==&replacement_pci);
+      /* A late replacement is seen once by the refused claim, then dropped. */
+      if(mode==APP_HANDOFF_LATE_REPLACED)CHECK(Gu.pci!=&replacement_pci);
       if(mode>=APP_ZERO_INFO && mode<APP_HANDOFF) {
         CHECK(!prompt || mode==APP_QUERY_RECHECK);
         CHECK(strstr(report_text,mode==APP_QUERY_RECHECK?"stage=armed-display":"stage=display"));
         CHECK(query_calls==((mode==APP_ZERO_PHYSICAL || mode==APP_SHORT_INFO || mode==APP_QUERY_MISSING || mode==APP_CACHED_RGB)?0:
           mode==APP_QUERY_RECHECK?2:1));
       }
-      if(mode>=APP_HANDOFF)CHECK(!disconnect_calls && bound && !exclusive_calls);
+      if(mode>=APP_HANDOFF) {
+        /* Refused releases never reach DisconnectController; FAIL/NOOP/REBIND
+           reach it but the owner stays bound. */
+        BOOLEAN refused=mode==APP_HANDOFF_MULTI || mode==APP_HANDOFF_BINDING ||
+          mode==APP_HANDOFF_IMAGE || mode==APP_HANDOFF_CHANGED || mode==APP_HANDOFF_ESCAPE;
+        BOOLEAN held=refused || mode==APP_HANDOFF_FAIL || mode==APP_HANDOFF_NOOP || mode==APP_HANDOFF_REBIND;
+        CHECK(disconnect_calls==(UINTN)(refused?0:1) && !bound==!held);
+        if(held)CHECK(!exclusive_calls);
+        if(mode>=APP_DECODE_BOTH && mode<=APP_DECODE_ENABLE_ERROR_MATCH) {
+          BOOLEAN enabled=mode==APP_DECODE_ENABLE_ERROR || mode==APP_DECODE_NOOP || mode==APP_DECODE_PARTIAL ||
+            mode==APP_DECODE_EXTRA_BME || mode==APP_DECODE_READ_FAIL || mode==APP_DECODE_ENABLE_ERROR_MATCH;
+          CHECK(attribute_enables==(UINTN)enabled);
+          CHECK(strstr(report_text,"config before decode restore") && strstr(report_text,"config[00]"));
+          if(mode==APP_DECODE_ENABLE_ERROR)CHECK(strstr(report_text,"config after decode restore") && strstr(report_text,"decode readback matched=0"));
+          if(mode==APP_DECODE_ENABLE_ERROR_MATCH)CHECK(strstr(report_text,"decode readback matched=1"));
+          if(mode==APP_DECODE_READ_FAIL)CHECK(strstr(report_text,"valid_bytes=16; snapshot incomplete"));
+        }
+      }
     }
-    if(!halted){CHECK(!exclusive && !fake.pool_live);for(int i=0;i<9;i++)CHECK(!files[i].open);}
+    if(!halted){CHECK(!exclusive && !fake.pool_live);for(int i=0;i<10;i++)CHECK(!files[i].open);}
     CHECK(!fake.pio_reads && !fake.pio_writes && !fake.dmem_reads);
     CHECK(current_tpl==TPL_APPLICATION);printf("EFI app %s: %s PASS\n",app_names[mode],halted?"halted with retained resources":"returned cleanly");
     dispose_host_fixture();

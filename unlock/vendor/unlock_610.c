@@ -2,6 +2,9 @@
 /* Modified 2026-10-18 for RTX 3080 UEFI: target selection, checked IO, execution/quiescence hooks and diagnostics. See THIRD_PARTY_NOTICES.md.
  * Modified 2026-10-20 for RTX 3090 Ti: device ID comes from board_profile.h; the
  * unlock sequence itself is unchanged.
+ * Modified 2026-11-11 for RTX 3090 Ti: a started-but-failed transaction runs
+ * the same bounded FLR as the success path (unlock_transaction_abort), so a
+ * proven-quiesced card reaches Windows instead of stopping the boot.
  * Pre-driver V67 unlock, run before the stock driver binds: FWSEC-FRTS from
  * the board ROM, Booter with the V67 signature, the SS0/SS1 selector writes, then
  * FLR so the stock driver starts from a clean, halted GSP.
@@ -1458,6 +1461,74 @@ static int unlock_transaction_reset(struct unlock_transaction_work *work)
 	return 0;
 }
 
+#ifdef GU_UEFI_PORT
+/* Failure containment for the single-GPU UEFI path. A transaction that got
+ * as far as launching firmware used to end only one way: WPR2 stayed
+ * enabled, the DMA buffers stayed retained, GuSafeToReturn() stayed false
+ * and the app halted the boot until a power-off. The bounded FLR the success
+ * path relies on proves quiescence after a failure too: it stops every
+ * engine, clears the WPR2 window FWSEC raised and leaves the post-reset
+ * card Windows expects. Every step reuses the checked primitives; any
+ * refusal leaves quiesced clear and the retain/halt outcome is unchanged. */
+static int unlock_transaction_abort(struct unlock_transaction_work *work)
+{
+	u32 identity, chip, lo, hi, cpuctl;
+	u16 command, pending;
+	int ret;
+
+	if (!work->firmware_started || work->quiesced || !work->mapped)
+		return GU_RESULT(-EPROTO);
+	if (work->master) {
+		pci_clear_master(work->pdev);
+		work->master = false;
+	}
+	if (diag_pci_word(work, false, PCI_COMMAND, &command) ||
+	    command == 0xffff || (command & PCI_COMMAND_MASTER))
+		return GU_RESULT(-EIO);
+	if (read_bar(work, 0, &chip) || !chip || inaccessible(chip))
+		return GU_RESULT(-ENODEV);
+	ret = aperture_remove_conflicting_pci_devices(work->pdev, "gpu_unlock");
+	if (ret)
+		return GU_RESULT(ret);
+	dev_info(&work->pdev->dev, "abort FLR begin: BME=0 DMA retained, chip=%#x\n", chip);
+	ret = pcie_flr(work->pdev);
+	dev_info(&work->pdev->dev, "abort FLR returned: result=%d\n", ret);
+	if (ret)
+		return GU_RESULT(ret);
+	pci_restore_state(work->pdev);
+	if (diag_pci_dword(work, false, PCI_VENDOR_ID, &identity) ||
+	    identity != GU_TARGET_PCI_ID ||
+	    diag_pci_word(work, false, PCI_COMMAND, &command) ||
+	    command == 0xffff || (command & PCI_COMMAND_MASTER))
+		return GU_RESULT(-ENODEV);
+	ret = wait_post_flr_bar(work, chip);
+	if (ret)
+		return GU_RESULT(ret);
+	ret = wait_post_flr_gfw(work);
+	if (ret)
+		return GU_RESULT(ret);
+	ret = hold_sec2_reset(work, "abort-FLR");
+	if (ret)
+		return GU_RESULT(ret);
+	if (diag_pci_word(work, true, PCI_EXP_DEVSTA, &pending) ||
+	    pending == 0xffff || (pending & PCI_EXP_DEVSTA_TRPND))
+		return GU_RESULT(-EBUSY);
+	if (read_bar(work, GU_GFW_CPUCTL_OFFSET, &cpuctl) || inaccessible(cpuctl) ||
+	    !(cpuctl & GU_GFW_CPUCTL_HALTED) ||
+	    read_bar(work, 0x001fa824, &lo) || inaccessible(lo) ||
+	    read_bar(work, 0x001fa828, &hi) || inaccessible(hi))
+		return GU_RESULT(-ENODEV);
+	dev_info(&work->pdev->dev,
+		 "abort containment complete: GSP halted, BME=0 pending=0 WPR2=%08x:%08x\n",
+		 lo, hi);
+	if (hi >> 4)
+		return GU_RESULT(-EBUSY);
+	work->quiesced = true;
+	GuQuiesced();
+	return 0;
+}
+#endif
+
 int gpu_unlock_610_load_shared(struct pci_dev *pdev, struct gpu_unlock_610_shared *shared)
 {
 	return request_scoped(&pdev->dev, &shared->gsp, GSP_FILE);
@@ -1503,6 +1574,20 @@ int gpu_unlock_610_unlock(struct pci_dev *pdev, const struct gpu_unlock_610_shar
 	/* Never leave the V67 signature published for a later stock boot. */
 	if (ret && work->signature_calls == 1)
 		unlock_transaction_signature(work);
+#ifdef GU_UEFI_PORT
+	/* Without containment a started-but-failed transaction can only halt:
+	 * firmware may still run, WPR2 stays enabled and the buffers stay
+	 * retained, so the next boot fails the cold check until a power-off.
+	 * A clean abort flips quiesced: unwind frees the buffers and the app
+	 * hands off to Windows with a post-reset card. The attempt marker
+	 * stays set, so the next boot still asks for U before retrying. */
+	if (ret) {
+		int aborted = unlock_transaction_abort(work);
+
+		dev_info(&pdev->dev, "abort containment: result=%d quiesced=%u\n",
+			 aborted, work->quiesced);
+	}
+#endif
 	cleanup = unlock_transaction_unwind(work);
 	if (!ret)
 		ret = cleanup;
